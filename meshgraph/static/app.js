@@ -1370,7 +1370,41 @@ function initSidebar() {
   });
 }
 
+const THEME_KEY = "meshgraph.theme";
+
+function currentTheme() {
+  return document.documentElement.dataset.theme === "light" ? "light" : "dark";
+}
+
+/** Переключает тему. Атрибут на <html> меняется мгновенно — CSS-переменные
+ *  перекрашивают страницу без перерисовки графа. persist=true — запомнить
+ *  выбор в localStorage (иначе страница продолжит следовать системе). */
+function applyTheme(theme, persist) {
+  document.documentElement.dataset.theme = theme;
+  const btn = $("themeBtn");
+  if (btn) {
+    const label = theme === "dark" ? "Светлая тема" : "Тёмная тема";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+  }
+  if (persist) storeSet(THEME_KEY, theme);
+}
+
+function initTheme() {
+  applyTheme(currentTheme());
+  $("themeBtn").addEventListener("click", () => {
+    applyTheme(currentTheme() === "dark" ? "light" : "dark", true);
+  });
+  /* Пока пользователь сам ничего не выбирал — страница следует за системой. */
+  try {
+    window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", (event) => {
+      if (storeGet(THEME_KEY) === null) applyTheme(event.matches ? "light" : "dark");
+    });
+  } catch { /* старые браузеры без addEventListener на matchMedia */ }
+}
+
 function init() {
+  initTheme();
   initSidebar();
   initChat();
 

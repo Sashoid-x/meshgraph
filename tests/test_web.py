@@ -102,6 +102,26 @@ def test_sidebar_sections_are_foldable(client):
     assert 'hasAttribute("data-nofold")' in app_js
 
 
+def test_theme_toggle(client):
+    """Переключатель темы: кнопка в шапке, выбор до отрисовки, светлый блок CSS."""
+    body = client.get("/").get_data(as_text=True)
+    assert 'id="themeBtn"' in body
+    assert "theme-icon-sun" in body and "theme-icon-moon" in body
+    # Тема применяется в <head> до отрисовки — без мигания при загрузке.
+    assert "meshgraph.theme" in body
+    assert "document.documentElement.dataset.theme" in body
+
+    root = Path(__file__).resolve().parents[1] / "meshgraph"
+    css = (root / "static" / "style.css").read_text(encoding="utf-8")
+    assert ':root[data-theme="light"]' in css
+    assert "--canvas-bg: #0a0d13" in css  # тёмная канва…
+    assert "--canvas-bg: #eef1f6" in css  # …и светлая отличаются
+
+    app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function initTheme()" in app_js
+    assert "storeSet(THEME_KEY, theme)" in app_js  # выбор запоминается
+
+
 # ---------------------------------------------------------------------------
 # Graph API
 # ---------------------------------------------------------------------------

@@ -25,6 +25,52 @@
   --sidebar-w: 320px;
   --topbar-h: 54px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Цвета, раньше зашитые прямо в правилах — теперь темизируемые. */
+  --canvas-bg: #0a0d13;
+  --overlay-bg: rgba(10, 13, 19, .72);
+  --tooltip-bg: rgba(22, 27, 34, .97);
+  --ctrl-bg: rgba(22, 27, 34, .9);
+  --btn-hover-bg: #222b37;
+  --btn-hover-border: #44506080;
+  --label-fill: #cbd5e1;
+  --label-halo: #0a0d13;
+  --label-gw: #ffd166;
+  --err-text: #ffb3ae;
+  --swatch-ring: #fff2;
+}
+
+/* Светлая тема: та же структура переменных, палитра в духе GitHub.
+   Включается атрибутом data-theme="light" на <html> — см. index.html. */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #ffffff;
+  --bg-soft: #f6f8fa;
+  --panel: #ffffff;
+  --panel-2: #eef1f4;
+  --border: #d0d7de;
+  --border-strong: #b6bfc9;
+  --text: #1f2328;
+  --muted: #59636e;
+  --faint: #7d8590;
+  --accent: #0969da;
+  --accent-strong: #0a58ca;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --err: #cf222e;
+
+  --canvas-bg: #eef1f6;
+  --overlay-bg: rgba(246, 248, 250, .76);
+  --tooltip-bg: rgba(255, 255, 255, .97);
+  --ctrl-bg: rgba(255, 255, 255, .92);
+  --btn-hover-bg: #eaeef2;
+  --btn-hover-border: rgba(31, 35, 40, .35);
+  --label-fill: #424a53;
+  --label-halo: #eef1f6;   /* ореол = цвет канвы, как в тёмной теме */
+  --label-gw: #8a6100;
+  --err-text: #a40e26;
+  --swatch-ring: rgba(31, 35, 40, .18);
 }
 
 * { box-sizing: border-box; }
@@ -101,7 +147,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   cursor: pointer;
   transition: background .15s, border-color .15s, transform .05s;
 }
-.btn:hover { background: #222b37; border-color: #44506080; }
+.btn:hover { background: var(--btn-hover-bg); border-color: var(--btn-hover-border); }
 .btn:active { transform: translateY(1px); }
 .btn-primary { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
 .btn-primary:hover { background: var(--accent); border-color: var(--accent); }
@@ -122,6 +168,13 @@ button, input, select, textarea { font: inherit; color: inherit; }
   transition: background .15s, border-color .15s;
 }
 .icon-btn:hover { background: var(--panel-2); border-color: var(--border-strong); }
+
+/* Иконки переключателя темы: показываем ту, что соответствует целевой теме.
+   Без атрибута data-theme (JS отключён) страница тёмная — показываем солнце. */
+.theme-icon-sun { display: block; }
+.theme-icon-moon { display: none; }
+:root[data-theme="light"] .theme-icon-sun { display: none; }
+:root[data-theme="light"] .theme-icon-moon { display: block; }
 
 /* ---------------------------------------------------------------- layout */
 
@@ -302,7 +355,7 @@ code {
   width: 46px; height: 9px; border-radius: 4px; flex: none;
   background: linear-gradient(90deg, #d73027, #fdae61, #a6d96a, #1a9850);
 }
-.swatch { width: 12px; height: 12px; border-radius: 50%; flex: none; border: 2px solid #fff2; }
+.swatch { width: 12px; height: 12px; border-radius: 50%; flex: none; border: 2px solid var(--swatch-ring); }
 .swatch-gw { background: #ffd166; box-shadow: 0 0 0 1.5px #ffd166; border-radius: 3px; }
 .swatch-node { background: #9fb3c8; }
 .line { width: 26px; height: 0; border-top: 2px dashed var(--muted); flex: none; }
@@ -318,13 +371,13 @@ code {
 
 /* ---------------------------------------------------------------- canvas */
 
-.canvas-wrap { position: relative; overflow: hidden; background: #0a0d13; }
+.canvas-wrap { position: relative; overflow: hidden; background: var(--canvas-bg); }
 .graph-canvas { position: absolute; inset: 0; }
 
 .overlay {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(10, 13, 19, .72);
+  background: var(--overlay-bg);
   z-index: 10;
 }
 .overlay[hidden] { display: none; }
@@ -354,7 +407,7 @@ code {
   position: absolute;
   z-index: 20;
   pointer-events: none;
-  background: rgba(22, 27, 34, .97);
+  background: var(--tooltip-bg);
   border: 1px solid var(--border-strong);
   border-radius: 8px;
   padding: 8px 11px;
@@ -374,22 +427,22 @@ code {
 .canvas-controls .icon-btn {
   width: 32px; height: 32px; padding: 0;
   justify-content: center; font-size: 15px;
-  background: rgba(22, 27, 34, .9);
+  background: var(--ctrl-bg);
 }
 
 /* ------------------------------------------------------------------ svg */
 
 .node-label {
   font-size: 11px;
-  fill: #cbd5e1;
+  fill: var(--label-fill);
   paint-order: stroke;
-  stroke: #0a0d13;
+  stroke: var(--label-halo);
   stroke-width: 3px;
   stroke-linejoin: round;
   pointer-events: none;
   user-select: none;
 }
-.node-gateway-label { fill: #ffd166; font-weight: 600; }
+.node-gateway-label { fill: var(--label-gw); font-weight: 600; }
 
 .link { transition: opacity .12s; }
 .dimmed { opacity: .12 !important; }
@@ -450,7 +503,7 @@ legend {
   margin-top: 14px;
   background: rgba(248, 81, 73, .1);
   border: 1px solid rgba(248, 81, 73, .4);
-  color: #ffb3ae;
+  color: var(--err-text);
   border-radius: 8px;
   padding: 10px 12px;
   font-size: 12.5px;
