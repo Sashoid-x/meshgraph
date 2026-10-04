@@ -1,0 +1,735 @@
+"""Build the graph payload the front end renders.
+
+Two modes:
+
+``traceroute``
+    Faithful port of Malla's ``TracerouteService.get_network_graph_data``:
+    RF hops parsed out of ``TRACEROUTE_APP`` payloads, plus the optional
+    indirect (end-to-end) connections.
+
+``rssi``
+    Direct receptions: every packet a gateway heard with 0 remaining hops
+    (``hop_start == hop_limit``) yields a gateway↔transmitter edge carrying the
+    measured RSSI/SNR.  This covers *every* transmitting node, not only the
+    ones that run traceroutes, which is why it produces a much denser graph.
+
+``combined``
+    Both of the above in one picture: the two sub-graphs are built with the
+    same filters and merged (union of nodes and links, per-mode stats kept
+    under ``stats.traceroute`` / ``stats.rssi``).
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import threading
+import time
+from typing import Any
+
+from . import store
+from .config import GRAPH_MODES, Settings
+from .traceroute import (
+    BROADCAST_NODE_ID,
+    build_rf_hops,
+    is_plausible_rssi,
+    is_plausible_snr,
+    is_plausible_traceroute_snr,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_LIMIT = 5000
+_CACHE_TTL_SECONDS = 20.0
+_cache: dict[str, tuple[float, dict]] = {}
+_cache_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _strength(avg_snr: float | None, avg_rssi: float | None, packet_count: int) -> float:
+    """Visual edge weight in the 1..10 range, matching Malla's formula."""
+    if avg_snr is not None:
+        raw = (avg_snr + 20) / 5
+    elif avg_rssi is not None:
+        raw = (avg_rssi + 120) / 8
+    else:
+        raw = 1.0
+    raw += math.log10(max(packet_count, 1))
+    return round(min(10, max(1, raw)), 1)
+
+
+def _node_size(packet_count: int) -> float:
+    return round(min(20, max(5, math.log10(packet_count + 1) * 3)), 1)
+
+
+def display_name(info: dict[str, Any] | None, node_id: int) -> str:
+    if info:
+        if info.get("long_name"):
+            return str(info["long_name"])
+        if info.get("short_name"):
+            return str(info["short_name"])
+        if info.get("hex_id"):
+            return str(info["hex_id"])
+    return f"!{node_id & 0xFFFFFFFF:08x}"
+
+
+def _location(info: dict[str, Any] | None) -> dict[str, float] | None:
+    if not info:
+        return None
+    if info.get("latitude") is None or info.get("longitude") is None:
+        return None
+    return {
+        "latitude": info["latitude"],
+        "longitude": info["longitude"],
+        "altitude": info.get("altitude"),
+    }
+
+
+def _time_window(hours: int) -> tuple[float, float]:
+    end = time.time()
+    return end - hours * 3600, end
+
+
+def _sanitize_snr(value: Any) -> float:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return -200.0
+    # -200 is the "no limit" sentinel, anything outside the radio range is junk.
+    if parsed < -200 or parsed > 20:
+        return -200.0
+    return parsed
+
+
+def sanitize_hours(hours: int | None) -> int:
+    try:
+        value = int(hours)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 24
+    return value if 1 <= value <= 720 else 24
+
+
+# ---------------------------------------------------------------------------
+# Mode: traceroute
+# ---------------------------------------------------------------------------
+
+def _build_traceroute(
+    settings: Settings,
+    hours: int,
+    min_snr: float,
+    include_indirect: bool,
+    channel: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    start_time, _ = _time_window(hours)
+
+    sql = """
+        SELECT id, timestamp, from_node_id, to_node_id, gateway_id,
+               hop_start, hop_limit, raw_payload
+        FROM packets
+        WHERE portnum_name = 'TRACEROUTE_APP'
+          AND processed = 1
+          AND timestamp >= ?
+    """
+    params: list[Any] = [start_time]
+    if channel:
+        sql += " AND channel_id = ?"
+        params.append(channel)
+    sql += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+
+    packets = store.query(settings.db_file, sql, params)
+
+    nodes: dict[int, dict[str, Any]] = {}
+    direct_links: dict[tuple[int, int], dict[str, Any]] = {}
+    indirect_connections: dict[tuple[int, int], dict[str, Any]] = {}
+
+    stats: dict[str, Any] = {
+        "mode": "traceroute",
+        "packets_analyzed": len(packets),
+        "packets_with_rf_hops": 0,
+        "total_rf_hops": 0,
+        "links_found": 0,
+        "links_filtered_by_snr": 0,
+        "links_filtered_due_to_snr_0": 0,
+    }
+
+    def touch(node_id: int, timestamp: float) -> None:
+        if node_id not in nodes:
+            nodes[node_id] = {
+                "id": node_id,
+                "packet_count": 0,
+                "total_snr": 0.0,
+                "snr_count": 0,
+                "connections": set(),
+                "last_seen": timestamp,
+            }
+        node = nodes[node_id]
+        node["packet_count"] += 1
+        node["last_seen"] = max(node["last_seen"], timestamp)
+
+    for row in packets:
+        if not row["raw_payload"]:
+            continue
+        try:
+            rf_hops = build_rf_hops(row)
+            if not rf_hops:
+                continue
+
+            stats["packets_with_rf_hops"] += 1
+            stats["total_rf_hops"] += len(rf_hops)
+
+            for hop_from, hop_to, snr in rf_hops:
+                if not is_plausible_traceroute_snr(snr) or (
+                    min_snr != -200 and snr < min_snr
+                ):
+                    stats["links_filtered_by_snr"] += 1
+                    continue
+                if snr == 0:
+                    # snr == 0 marks an MQTT/UDP injected link, not an RF hop.
+                    stats["links_filtered_due_to_snr_0"] += 1
+                    continue
+                if BROADCAST_NODE_ID in (hop_from, hop_to):
+                    continue
+
+                touch(hop_from, row["timestamp"])
+                touch(hop_to, row["timestamp"])
+
+                link_key = tuple(sorted((hop_from, hop_to)))
+                link = direct_links.get(link_key)
+                if link is None:
+                    direct_links[link_key] = {
+                        "source": link_key[0],
+                        "target": link_key[1],
+                        "snr_values": [snr],
+                        "packet_count": 1,
+                        "last_seen": row["timestamp"],
+                        "last_packet_id": row["id"],
+                    }
+                    stats["links_found"] += 1
+                else:
+                    link["snr_values"].append(snr)
+                    link["packet_count"] += 1
+                    if row["timestamp"] > link["last_seen"]:
+                        link["last_seen"] = row["timestamp"]
+                        link["last_packet_id"] = row["id"]
+
+                nodes[hop_from]["connections"].add(hop_to)
+                nodes[hop_to]["connections"].add(hop_from)
+                nodes[hop_from]["total_snr"] += snr
+                nodes[hop_from]["snr_count"] += 1
+
+            if include_indirect and len(rf_hops) > 1:
+                first_hop, last_hop = rf_hops[0], rf_hops[-1]
+                indirect_key = tuple(sorted((first_hop[0], last_hop[1])))
+                # Endpoints already connected by a direct hop need no indirect
+                # line; a round trip that ends where it started would draw the
+                # node as its own neighbour, which is not a connection.
+                if (
+                    indirect_key[0] != indirect_key[1]
+                    and indirect_key not in direct_links
+                ):
+                    conn = indirect_connections.get(indirect_key)
+                    if conn is None:
+                        path_snrs = [
+                            snr
+                            for _, _, snr in rf_hops
+                            if is_plausible_traceroute_snr(snr)
+                        ]
+                        indirect_connections[indirect_key] = {
+                            "source": indirect_key[0],
+                            "target": indirect_key[1],
+                            "hop_count": len(rf_hops),
+                            "path_count": 1,
+                            "avg_snr": round(sum(path_snrs) / len(path_snrs), 1)
+                            if path_snrs
+                            else None,
+                            "last_seen": row["timestamp"],
+                            "last_packet_id": row["id"],
+                        }
+                    else:
+                        conn["path_count"] += 1
+                        conn["last_seen"] = max(conn["last_seen"], row["timestamp"])
+
+        except Exception as exc:  # noqa: BLE001 - one bad packet must not abort
+            logger.warning("Error processing traceroute packet %s: %s", row["id"], exc)
+            continue
+
+    processed_links = []
+    for link in direct_links.values():
+        avg_snr = sum(link["snr_values"]) / len(link["snr_values"])
+        processed_links.append(
+            {
+                "source": link["source"],
+                "target": link["target"],
+                "type": "direct",
+                "avg_snr": round(avg_snr, 1),
+                "packet_count": link["packet_count"],
+                "strength": _strength(avg_snr, None, link["packet_count"]),
+                "last_seen": link["last_seen"],
+            }
+        )
+
+    processed_indirect = []
+    if include_indirect:
+        for conn in indirect_connections.values():
+            processed_indirect.append(
+                {
+                    "source": conn["source"],
+                    "target": conn["target"],
+                    "type": "indirect",
+                    "hop_count": conn["hop_count"],
+                    "path_count": conn["path_count"],
+                    "avg_snr": conn["avg_snr"],
+                    "strength": min(
+                        5, max(0.5, conn["path_count"] / conn["hop_count"])
+                    ),
+                    "last_seen": conn["last_seen"],
+                }
+            )
+
+    return _finish(
+        settings=settings,
+        mode="traceroute",
+        hours=hours,
+        min_snr=min_snr,
+        include_indirect=include_indirect,
+        channel=channel,
+        nodes=nodes,
+        links=processed_links,
+        indirect=processed_indirect,
+        stats=stats,
+        start_time=start_time,
+        node_snr_from="total_snr",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode: RSSI (direct receptions)
+# ---------------------------------------------------------------------------
+
+def _build_rssi(
+    settings: Settings,
+    hours: int,
+    min_snr: float,
+    include_indirect: bool,  # not meaningful here; kept for API symmetry
+    channel: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    start_time, _ = _time_window(hours)
+
+    common_where = """
+        WHERE timestamp >= ?
+          AND gateway_node_id IS NOT NULL
+          AND from_node_id IS NOT NULL
+          AND from_node_id != gateway_node_id
+    """
+    common_params: list[Any] = [start_time]
+    if channel:
+        common_where += " AND channel_id = ?"
+        common_params.append(channel)
+
+    # Only packets whose hop budget is untouched were heard directly by the
+    # gateway; anything with hop_limit < hop_start came in via a relay and
+    # says nothing about the RF link between gateway and transmitter.
+    sql = (
+        "SELECT id, timestamp, from_node_id, gateway_node_id, gateway_id, rssi, snr "
+        "FROM packets "
+        + common_where
+        + " AND hop_start IS NOT NULL AND hop_limit IS NOT NULL AND hop_start = hop_limit"
+        + " ORDER BY timestamp DESC LIMIT ?"
+    )
+    rows = store.query(settings.db_file, sql, [*common_params, limit])
+
+    relayed_sql = (
+        "SELECT COUNT(*) AS n FROM packets "
+        + common_where
+        + " AND (hop_start IS NULL OR hop_limit IS NULL OR hop_start != hop_limit)"
+    )
+    relayed = store.query(settings.db_file, relayed_sql, common_params)
+    relayed_count = int(relayed[0]["n"]) if relayed else 0
+
+    nodes: dict[int, dict[str, Any]] = {}
+    links_raw: dict[tuple[int, int], dict[str, Any]] = {}
+
+    stats: dict[str, Any] = {
+        "mode": "rssi",
+        "receptions_analyzed": len(rows),
+        "receptions_relayed": relayed_count,
+        "receptions_plausible": 0,
+        "links_found": 0,
+        "links_filtered": 0,
+    }
+
+    def touch(node_id: int, timestamp: float, snr: float | None, rssi: float | None):
+        if node_id not in nodes:
+            nodes[node_id] = {
+                "id": node_id,
+                "packet_count": 0,
+                "snr_values": [],
+                "rssi_values": [],
+                "connections": set(),
+                "last_seen": timestamp,
+            }
+        node = nodes[node_id]
+        node["packet_count"] += 1
+        node["last_seen"] = max(node["last_seen"], timestamp)
+        if snr is not None:
+            node["snr_values"].append(snr)
+        if rssi is not None:
+            node["rssi_values"].append(rssi)
+
+    for row in rows:
+        snr = float(row["snr"]) if is_plausible_snr(row["snr"]) else None
+        rssi = float(row["rssi"]) if is_plausible_rssi(row["rssi"]) else None
+
+        if snr is None and rssi is None:
+            stats["links_filtered"] += 1
+            continue
+        if min_snr != -200 and (snr is None or snr < min_snr):
+            stats["links_filtered"] += 1
+            continue
+
+        stats["receptions_plausible"] += 1
+
+        gateway_id = int(row["gateway_node_id"])
+        from_id = int(row["from_node_id"])
+        link_key = tuple(sorted((gateway_id, from_id)))
+
+        touch(gateway_id, row["timestamp"], snr, rssi)
+        touch(from_id, row["timestamp"], snr, rssi)
+        nodes[gateway_id]["connections"].add(from_id)
+        nodes[from_id]["connections"].add(gateway_id)
+
+        link = links_raw.get(link_key)
+        if link is None:
+            links_raw[link_key] = {
+                "source": link_key[0],
+                "target": link_key[1],
+                "snr_values": [snr] if snr is not None else [],
+                "rssi_values": [rssi] if rssi is not None else [],
+                "packet_count": 1,
+                "last_seen": row["timestamp"],
+            }
+            stats["links_found"] += 1
+        else:
+            link["packet_count"] += 1
+            if snr is not None:
+                link["snr_values"].append(snr)
+            if rssi is not None:
+                link["rssi_values"].append(rssi)
+            if row["timestamp"] > link["last_seen"]:
+                link["last_seen"] = row["timestamp"]
+
+    processed_links = []
+    for link in links_raw.values():
+        avg_snr = (
+            sum(link["snr_values"]) / len(link["snr_values"])
+            if link["snr_values"]
+            else None
+        )
+        avg_rssi = (
+            sum(link["rssi_values"]) / len(link["rssi_values"])
+            if link["rssi_values"]
+            else None
+        )
+        processed_links.append(
+            {
+                "source": link["source"],
+                "target": link["target"],
+                "type": "direct",
+                "avg_snr": round(avg_snr, 1) if avg_snr is not None else None,
+                "avg_rssi": round(avg_rssi, 1) if avg_rssi is not None else None,
+                "packet_count": link["packet_count"],
+                "strength": _strength(avg_snr, avg_rssi, link["packet_count"]),
+                "last_seen": link["last_seen"],
+            }
+        )
+
+    return _finish(
+        settings=settings,
+        mode="rssi",
+        hours=hours,
+        min_snr=min_snr,
+        include_indirect=False,
+        channel=channel,
+        nodes=nodes,
+        links=processed_links,
+        indirect=[],
+        stats=stats,
+        start_time=start_time,
+        node_snr_from="snr_values",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode: combined (traceroute + direct receptions)
+# ---------------------------------------------------------------------------
+
+# Fields where an empty value in the traceroute view can be filled from the
+# reception view (and vice versa): names/roles/coordinates come from the same
+# node lookup in both, SNR/RSSI describe different measurements.
+_COMBINED_NODE_KEYS = ("avg_snr", "avg_rssi", "name", "hex_id", "role", "hw_model", "location")
+
+
+def _build_combined(
+    settings: Settings,
+    hours: int,
+    min_snr: float,
+    include_indirect: bool,
+    channel: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Traceroute hops and direct receptions drawn as a single graph.
+
+    Both sub-graphs are built with the caller's filters and then unioned.
+    A link seen by both modes keeps one row with ``modes`` listing where it
+    came from: SNR prefers the traceroute measurement, RSSI comes from the
+    receptions.  Node counters take the per-mode maximum rather than the sum,
+    because the very same packet feeds both sub-graphs.
+    """
+    trace = _build_traceroute(
+        settings, hours, min_snr, include_indirect, channel, limit
+    )
+    rssi = _build_rssi(settings, hours, min_snr, include_indirect, channel, limit)
+
+    nodes: dict[int, dict[str, Any]] = {}
+    for payload in (trace, rssi):
+        for node in payload["nodes"]:
+            current = nodes.get(node["id"])
+            if current is None:
+                nodes[node["id"]] = dict(node)
+                continue
+            current["packet_count"] = max(
+                current["packet_count"], node["packet_count"]
+            )
+            current["last_seen"] = max(current["last_seen"], node["last_seen"])
+            current["size"] = max(current["size"], node["size"])
+            current["is_gateway"] = current["is_gateway"] or node["is_gateway"]
+            for key in _COMBINED_NODE_KEYS:
+                if current.get(key) in (None, "") and node.get(key) not in (None, ""):
+                    current[key] = node[key]
+
+    links: dict[tuple[int, int], dict[str, Any]] = {}
+    for payload, kind in ((trace, "traceroute"), (rssi, "rssi")):
+        for link in payload["links"]:
+            key = (link["source"], link["target"])
+            current = links.get(key)
+            if current is None:
+                merged = dict(link)
+                merged["modes"] = [kind]
+                links[key] = merged
+                continue
+            current["modes"].append(kind)
+            current["packet_count"] = max(
+                current["packet_count"], link["packet_count"]
+            )
+            current["last_seen"] = max(current["last_seen"], link["last_seen"])
+            if current.get("avg_snr") is None:
+                current["avg_snr"] = link.get("avg_snr")
+            if current.get("avg_rssi") is None:
+                current["avg_rssi"] = link.get("avg_rssi")
+            current["strength"] = _strength(
+                current.get("avg_snr"),
+                current.get("avg_rssi"),
+                current["packet_count"],
+            )
+
+    # Each sub-graph counted neighbours inside itself only; recompute the
+    # degree from the merged edge set so the sidebar reports the union.
+    neighbors: dict[int, set[int]] = {}
+    for source, target in links:
+        neighbors.setdefault(source, set()).add(target)
+        neighbors.setdefault(target, set()).add(source)
+    for node_id, node in nodes.items():
+        node["connections"] = len(neighbors.get(node_id, set()))
+
+    indirect = trace["indirect_connections"]
+    trace_stats = trace["stats"]
+    rssi_stats = rssi["stats"]
+    stats: dict[str, Any] = {
+        "mode": "combined",
+        # One number per sidebar row; the full per-mode detail is nested.
+        "packets_analyzed": rssi_stats.get("receptions_analyzed", 0),
+        "receptions_analyzed": rssi_stats.get("receptions_analyzed", 0),
+        "receptions_relayed": rssi_stats.get("receptions_relayed", 0),
+        "packets_with_rf_hops": trace_stats.get("packets_with_rf_hops", 0),
+        "total_rf_hops": trace_stats.get("total_rf_hops", 0),
+        "links_filtered": rssi_stats.get("links_filtered", 0),
+        "links_filtered_by_snr": trace_stats.get("links_filtered_by_snr", 0),
+        "traceroute": trace_stats,
+        "rssi": rssi_stats,
+        "nodes": len(nodes),
+        "links": len(links),
+        "indirect": len(indirect),
+        "gateways": sum(1 for node in nodes.values() if node["is_gateway"]),
+    }
+
+    return {
+        "mode": "combined",
+        "nodes": list(nodes.values()),
+        "links": sorted(links.values(), key=lambda l: -l["packet_count"]),
+        "indirect_connections": indirect,
+        "stats": stats,
+        "filters": trace["filters"],
+        "generated_at": time.time(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared finishing step
+# ---------------------------------------------------------------------------
+
+def _finish(
+    *,
+    settings: Settings,
+    mode: str,
+    hours: int,
+    min_snr: float,
+    include_indirect: bool,
+    channel: str | None,
+    nodes: dict[int, dict[str, Any]],
+    links: list[dict[str, Any]],
+    indirect: list[dict[str, Any]],
+    stats: dict[str, Any],
+    start_time: float,
+    node_snr_from: str,
+) -> dict[str, Any]:
+    node_ids = list(nodes)
+    lookup = store.node_lookup(settings.db_file, node_ids)
+    gateways = store.gateway_ids(settings.db_file, start_time)
+
+    processed_nodes = []
+    for node_id, data in nodes.items():
+        info = lookup.get(node_id)
+
+        snr_source = data.get(node_snr_from)
+        avg_snr = None
+        if isinstance(snr_source, list):
+            if snr_source:
+                avg_snr = round(sum(snr_source) / len(snr_source), 1)
+        elif data.get("snr_count"):
+            avg_snr = round(data["total_snr"] / data["snr_count"], 1)
+
+        rssi_source = data.get("rssi_values")
+        avg_rssi = (
+            round(sum(rssi_source) / len(rssi_source), 1) if rssi_source else None
+        )
+
+        node_info = {
+            "id": node_id,
+            "name": display_name(info, node_id),
+            "hex_id": (info or {}).get("hex_id") or f"!{node_id & 0xFFFFFFFF:08x}",
+            "packet_count": data["packet_count"],
+            "connections": len(data["connections"]),
+            "avg_snr": avg_snr,
+            "avg_rssi": avg_rssi,
+            "last_seen": data["last_seen"],
+            "size": _node_size(data["packet_count"]),
+            "is_gateway": node_id in gateways,
+            "role": (info or {}).get("role"),
+            "hw_model": (info or {}).get("hw_model"),
+        }
+        loc = _location(info)
+        if loc:
+            node_info["location"] = loc
+        processed_nodes.append(node_info)
+
+    processed_links = sorted(links, key=lambda l: -l["packet_count"])
+
+    stats.update(
+        {
+            "nodes": len(processed_nodes),
+            "links": len(processed_links),
+            "indirect": len(indirect),
+            "gateways": sum(1 for n in processed_nodes if n["is_gateway"]),
+        }
+    )
+
+    return {
+        "mode": mode,
+        "nodes": processed_nodes,
+        "links": processed_links,
+        "indirect_connections": indirect,
+        "stats": stats,
+        "filters": {
+            "hours": hours,
+            "min_snr": min_snr,
+            "include_indirect": include_indirect,
+            "channel": channel or "",
+        },
+        "generated_at": time.time(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def build_graph(
+    settings: Settings,
+    mode: str = "traceroute",
+    hours: int = 24,
+    min_snr: float = -200.0,
+    include_indirect: bool = False,
+    channel: str | None = None,
+    limit: int | None = None,
+    use_cache: bool = True,
+) -> dict[str, Any]:
+    """Build the graph JSON for the requested filters."""
+    hours = sanitize_hours(hours)
+    min_snr = _sanitize_snr(min_snr)
+    channel = (channel or "").strip() or None
+    limit = limit or settings.graph_packet_limit or DEFAULT_LIMIT
+
+    if mode not in GRAPH_MODES:
+        mode = "traceroute"
+
+    cache_key = "|".join(
+        [
+            settings.db_file,
+            mode,
+            str(hours),
+            str(min_snr),
+            str(bool(include_indirect)),
+            channel or "-",
+            str(limit),
+        ]
+    )
+
+    if use_cache:
+        with _cache_lock:
+            cached = _cache.get(cache_key)
+            if cached and time.time() - cached[0] < _CACHE_TTL_SECONDS:
+                return cached[1]
+
+    if mode == "rssi":
+        payload = _build_rssi(
+            settings, hours, min_snr, include_indirect, channel, limit
+        )
+    elif mode == "combined":
+        payload = _build_combined(
+            settings, hours, min_snr, include_indirect, channel, limit
+        )
+    else:
+        payload = _build_traceroute(
+            settings, hours, min_snr, include_indirect, channel, limit
+        )
+
+    if use_cache:
+        with _cache_lock:
+            # Bound the cache so a stream of distinct filters can't grow it
+            # without limit.
+            if len(_cache) > 64:
+                _cache.clear()
+            _cache[cache_key] = (time.time(), payload)
+
+    return payload
+
+
+def invalidate_cache() -> None:
+    with _cache_lock:
+        _cache.clear()

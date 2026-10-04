@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Граф сети Meshtastic</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">⬡</span>
+    <div class="brand-text">
+      <strong>Граф сети Meshtastic</strong>
+      <span class="brand-sub">meshgraph v{{ version }}</span>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <div class="status" id="mqttStatus" title="Состояние MQTT-подключения">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">подключение…</span>
+      <span class="status-sep">·</span>
+      <span id="statusCounters">0 пакетов</span>
+    </div>
+
+    <button class="icon-btn" id="settingsBtn" title="Настройки подключения к MQTT-брокеру" aria-label="Настройки">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path fill="currentColor" d="M19.4 13a7.6 7.6 0 0 0 .1-1 7.6 7.6 0 0 0-.1-1l2.1-1.7a.5.5 0 0 0 .1-.6l-2-3.4a.5.5 0 0 0-.6-.2l-2.5 1a7.7 7.7 0 0 0-1.7-1l-.4-2.6a.5.5 0 0 0-.5-.4h-4a.5.5 0 0 0-.5.4l-.4 2.6a7.7 7.7 0 0 0-1.7 1l-2.5-1a.5.5 0 0 0-.6.2l-2 3.4a.5.5 0 0 0 .1.6L4.5 11a7.6 7.6 0 0 0 0 2l-2.1 1.7a.5.5 0 0 0-.1.6l2 3.4c.1.2.4.3.6.2l2.5-1a7.7 7.7 0 0 0 1.7 1l.4 2.6c0 .2.2.4.5.4h4c.2 0 .4-.2.5-.4l.4-2.6a7.7 7.7 0 0 0 1.7-1l2.5 1c.2.1.5 0 .6-.2l2-3.4a.5.5 0 0 0-.1-.6L19.4 13ZM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Z"/>
+      </svg>
+      <span>Настройки</span>
+    </button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ------------------------------- Sidebar ------------------------------ -->
+  <aside class="sidebar">
+
+    <section class="panel" id="secModes">
+      <h2 class="panel-title">Источник связей</h2>
+      <div class="mode-switch" id="modeSwitch">
+        <label class="mode-option">
+          <input type="radio" name="mode" value="traceroute"
+                 {% if default_mode == 'traceroute' %}checked{% endif %}>
+          <span class="mode-body">
+            <span class="mode-name">Traceroute</span>
+            <span class="mode-desc">RF-хопы из пакетов трассировки — как в Malla</span>
+          </span>
+        </label>
+        <label class="mode-option">
+          <input type="radio" name="mode" value="rssi"
+                 {% if default_mode == 'rssi' %}checked{% endif %}>
+          <span class="mode-body">
+            <span class="mode-name">RSSI-приёмы</span>
+            <span class="mode-desc">Шлюз ↔ узел по факту приёма, плотнее</span>
+          </span>
+        </label>
+
+        <label class="mode-option">
+          <input type="radio" name="mode" value="combined"
+                 {% if default_mode == 'combined' %}checked{% endif %}>
+          <span class="mode-body">
+            <span class="mode-name">Вместе</span>
+            <span class="mode-desc">Трассировки и прямые приёмы в одном графе</span>
+          </span>
+        </label>
+      </div>
+    </section>
+
+    <section class="panel" id="secFilters">
+      <h2 class="panel-title">Фильтры</h2>
+
+      <div class="field">
+        <label for="hours">Период</label>
+        <select id="hours">
+          <option value="1" {% if default_hours == 1 %}selected{% endif %}>Последний час</option>
+          <option value="6" {% if default_hours == 6 %}selected{% endif %}>6 часов</option>
+          <option value="12" {% if default_hours == 12 %}selected{% endif %}>12 часов</option>
+          <option value="24" {% if default_hours == 24 %}selected{% endif %}>24 часа</option>
+          <option value="72" {% if default_hours == 72 %}selected{% endif %}>3 дня</option>
+          <option value="168" {% if default_hours == 168 %}selected{% endif %}>7 дней</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="minSnr">Минимальный SNR, дБ</label>
+        <select id="minSnr">
+          <option value="-200">Без ограничения</option>
+          <option value="-20">−20 и выше</option>
+          <option value="-15">−15 и выше</option>
+          <option value="-10">−10 и выше</option>
+          <option value="0">0 и выше</option>
+          <option value="5">5 и выше</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="channel">Канал</label>
+        <select id="channel">
+          <option value="">Все каналы</option>
+        </select>
+      </div>
+
+      <label class="check" id="indirectWrap">
+        <input type="checkbox" id="includeIndirect">
+        <span>Показать непрямые (многохоповые) связи</span>
+      </label>
+
+      <button class="btn btn-primary btn-block" id="applyBtn">Применить</button>
+      <div class="hint" id="applyHint">Фильтры применяются и по кнопке, и по Enter.</div>
+    </section>
+
+    <section class="panel" id="secStats">
+      <h2 class="panel-title">Статистика</h2>
+      <dl class="stats" id="stats">
+        <div><dt>Узлов</dt><dd id="stNodes">—</dd></div>
+        <div><dt>Связей</dt><dd id="stLinks">—</dd></div>
+        <div><dt>Островов</dt><dd id="stIslands">—</dd></div>
+        <div><dt>Шлюзов</dt><dd id="stGateways">—</dd></div>
+        <div><dt>Пакетов</dt><dd id="stPackets">—</dd></div>
+        <div><dt>Через реле</dt><dd id="stRelayed">—</dd></div>
+        <div><dt>Обновлено</dt><dd id="stUpdated">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel" id="secSearch" data-nofold>
+      <h2 class="panel-title">Поиск узла</h2>
+      <input type="search" id="nodeSearch" placeholder="Имя или !hex-id…" autocomplete="off">
+      <div class="search-results" id="searchResults"></div>
+    </section>
+
+    <section class="panel" id="secLegend">
+      <h2 class="panel-title">Легенда</h2>
+      <div class="legend">
+        <div class="legend-row">
+          <span class="grad"></span>
+          <span>SNR связи: красный (плохой) → зелёный (хороший)</span>
+        </div>
+        <div class="legend-row">
+          <span class="swatch swatch-gw"></span>
+          <span>Шлюз (ретранслирует в MQTT)</span>
+        </div>
+        <div class="legend-row">
+          <span class="swatch swatch-node"></span>
+          <span>Обычный узел</span>
+        </div>
+        <div class="legend-row">
+          <span class="line line-dashed"></span>
+          <span>Непрямая связь (сквозной путь)</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="detailsPanel" data-nofold hidden>
+      <div class="panel-head">
+        <h2 class="panel-title">Выделено</h2>
+        <button class="btn btn-ghost btn-sm" id="clearSelection">Сброс</button>
+      </div>
+      <div id="detailsBody" class="details"></div>
+    </section>
+
+  </aside>
+
+  <!-- ------------------------------- Canvas ------------------------------- -->
+  <div class="canvas-wrap">
+    <div id="graphCanvas" class="graph-canvas"></div>
+    <div class="overlay" id="loading" hidden><div class="spinner"></div></div>
+    <div class="overlay overlay-msg" id="message" hidden>
+      <div class="msg-card">
+        <div class="msg-title" id="messageTitle">Пусто</div>
+        <div class="msg-text" id="messageText"></div>
+        <button class="btn btn-primary btn-sm" id="messageSettings">Открыть настройки</button>
+      </div>
+    </div>
+    <div class="tooltip" id="tooltip" hidden></div>
+    <div class="canvas-controls">
+      <button class="icon-btn" id="zoomIn" title="Приблизить">＋</button>
+      <button class="icon-btn" id="zoomOut" title="Отдалить">−</button>
+      <button class="icon-btn" id="zoomFit" title="Вписать">⤢</button>
+    </div>
+  </div>
+
+</main>
+
+<!-- ------------------------------- Settings ------------------------------ -->
+<div class="modal-backdrop" id="settingsModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-head">
+      <h2 id="settingsTitle">Настройки подключения</h2>
+      <button class="icon-btn" id="settingsClose" aria-label="Закрыть">✕</button>
+    </div>
+
+    <form id="settingsForm" class="modal-body">
+      <fieldset>
+        <legend>MQTT-брокер</legend>
+
+        <div class="grid2">
+          <div class="field">
+            <label for="setBroker">Адрес брокера</label>
+            <input id="setBroker" name="mqtt_broker_address" type="text" placeholder="mqtt.example.local" required>
+          </div>
+          <div class="field">
+            <label for="setPort">Порт</label>
+            <input id="setPort" name="mqtt_port" type="number" min="1" max="65535" value="1883">
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="field">
+            <label for="setUser">Пользователь</label>
+            <input id="setUser" name="mqtt_username" type="text" autocomplete="username" placeholder="необязательно">
+          </div>
+          <div class="field">
+            <label for="setPass">Пароль</label>
+            <input id="setPass" name="mqtt_password" type="password" autocomplete="current-password"
+                   placeholder="необязательно">
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="field">
+            <label for="setPrefix">Префикс топика</label>
+            <input id="setPrefix" name="mqtt_topic_prefix" type="text" value="msh">
+          </div>
+          <div class="field">
+            <label for="setSuffix">Шаблон топика</label>
+            <input id="setSuffix" name="mqtt_topic_suffix" type="text" value="/+/+/+/#">
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="setClientId">Client ID <span class="opt">пусто = случайный</span></label>
+          <input id="setClientId" name="mqtt_client_id" type="text" placeholder="">
+        </div>
+
+        <div class="field">
+          <label>Соединение</label>
+          <label class="check" for="setTls">
+            <input type="checkbox" id="setTls" name="mqtt_tls">
+            <span>TLS — нужен для брокеров вроде <code>mqtt.onemesh.ru:8883</code></span>
+          </label>
+          <label class="check" for="setTlsInsecure">
+            <input type="checkbox" id="setTlsInsecure" name="mqtt_tls_insecure">
+            <span>Не проверять сертификат (самоподписанные сертификаты)</span>
+          </label>
+        </div>
+
+        <div class="hint" id="topicHint">Будет подписка: <code id="topicPreview">msh/+/+/+/#</code><span id="topicWarn"></span></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Шифрование каналов</legend>
+        <div class="field">
+          <label for="setKeys">Ключи каналов (base64, через запятую)</label>
+          <textarea id="setKeys" name="decryption_keys" rows="3"
+                    spellcheck="false"></textarea>
+          <div class="hint">Без ключа зашифрованные traceroute-пакеты отбрасываются и граф трассировки останется пустым. Короткие ключи вроде <code>AQ==</code> (дефолтный LongFast) тоже можно указывать — прошивка раскрывает их в полный ключ сама.</div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Хранение и поведение</legend>
+        <div class="grid2">
+          <div class="field">
+            <label for="setMode">Режим графа по умолчанию</label>
+            <select id="setMode" name="default_graph_mode">
+              <option value="traceroute">Traceroute</option>
+              <option value="rssi">RSSI-приёмы</option>
+              <option value="combined">Вместе</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="setHours">Период по умолчанию, ч</label>
+            <input id="setHours" name="default_hours" type="number" min="1" max="720" value="24">
+          </div>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label for="setRetention">Хранение истории, часов</label>
+            <input id="setRetention" name="retention_hours" type="number" min="0" value="0">
+            <div class="hint">0 — хранить бессрочно.</div>
+          </div>
+          <div class="field">
+            <label for="setLimit">Лимит пакетов на построение</label>
+            <input id="setLimit" name="graph_packet_limit" type="number" min="100" max="100000" value="5000">
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="form-errors" id="formErrors" hidden></div>
+    </form>
+
+    <div class="modal-foot">
+      <div class="hint" id="settingsHint">Изменения применяются сразу: соединение переустанавливается.</div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="settingsCancel" type="button">Отмена</button>
+        <button class="btn btn-primary" id="settingsSave" type="button">Сохранить</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- --------------------------------- Chat -------------------------------- -->
+<div class="chat" id="chatWindow">
+  <div class="chat-head" id="chatHead">
+    <span class="chat-title">Чат канала</span>
+    <span class="chat-badge" id="chatBadge" hidden></span>
+    <span class="chat-head-spacer"></span>
+    <button class="icon-btn chat-fold" id="chatCollapse" type="button"
+            title="Свернуть чат" aria-label="Свернуть чат">▾</button>
+  </div>
+  <div class="chat-body" id="chatBody">
+    <div class="chat-list" id="chatList"></div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='d3.v7.min.js') }}"></script>
+<script src="{{ url_for('static', filename='layout.js') }}"></script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

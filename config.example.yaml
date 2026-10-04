@@ -1,0 +1,21 @@
+# Пример настроек meshgraph. При установке копируется в config.yaml.
+# Пароль брокера и ключи шифрования здесь намеренно пустые — заполните их
+# диалогом «Настройки» на странице (сохраняются в тот же config.yaml).
+
+mqtt_broker_address: ''
+mqtt_port: 8883
+mqtt_username: ''
+mqtt_password: ''
+mqtt_topic_prefix: msh
+mqtt_topic_suffix: /+/+/+/#
+mqtt_client_id: ''
+mqtt_tls: true
+mqtt_tls_insecure: false
+decryption_keys: AQ==
+db_file: data/graph.db
+retention_hours: 0
+graph_packet_limit: 5000
+web_host: 0.0.0.0
+web_port: 5010
+default_graph_mode: combined
+default_hours: 24
