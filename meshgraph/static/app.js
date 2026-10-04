@@ -878,7 +878,7 @@ async function loadChat() {
 
 function chatSignature(messages) {
   return JSON.stringify(
-    messages.map((m) => [m.id, m.ts, m.name, m.text, m.reply_to, m.reactions, m.phantom])
+    messages.map((m) => [m.id, m.ts, m.name, m.text, m.image, m.reply_to, m.reactions, m.phantom])
   );
 }
 
@@ -926,6 +926,48 @@ function appendChatReactions(bubble, reactions) {
   bubble.appendChild(chips);
 }
 
+// Картинка пиксель-арта: рисуем на canvas целыми пикселями (без сглаживания),
+// цвета берём из палитры пакета — она своя у каждой картинки и не зависит
+// от темы страницы; рамка вокруг — обычная, живёт на CSS-переменных.
+function pixelArtEl(image) {
+  const palette =
+    MESHGRAPH_PIXEL_PALETTES[image.theme] || MESHGRAPH_PIXEL_PALETTES[0];
+  const scale = meshgraphPixelScale(
+    image.w, image.h,
+    MESHGRAPH_PIXEL_MAX_W, MESHGRAPH_PIXEL_MAX_H, MESHGRAPH_PIXEL_MAX_SCALE
+  );
+  const wrap = chatEl("div", "chat-pixelart");
+  const canvas = document.createElement("canvas");
+  canvas.width = image.w * scale;
+  canvas.height = image.h * scale;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = palette.bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const pixels = meshgraphDecodePixels(image);
+  ctx.fillStyle = palette.fg;
+  for (let y = 0; y < image.h; y++) {
+    for (let x = 0; x < image.w; x++) {
+      if (pixels[y * image.w + x]) {
+        ctx.fillRect(x * scale, y * scale, scale, scale);
+      }
+    }
+  }
+  // Сетка как в прошивке: линия внизу и справа каждого пикселя, но только
+  // при масштабе ≥ 3 — на мелком она бы лишь пачкала картинку.
+  if (image.grid && scale >= 3) {
+    ctx.fillStyle = palette.fg;
+    for (let y = 1; y <= image.h; y++) {
+      ctx.fillRect(0, y * scale - 1, image.w * scale, 1);
+    }
+    for (let x = 1; x <= image.w; x++) {
+      ctx.fillRect(x * scale - 1, 0, 1, image.h * scale);
+    }
+  }
+  wrap.appendChild(canvas);
+  wrap.title = `${image.w}×${image.h} · ${palette.name}`;
+  return wrap;
+}
+
 function chatMessageEl(msg) {
   const row = chatEl("div", "chat-msg");
   if (msg.packet_id) row.dataset.pid = String(msg.packet_id);
@@ -963,7 +1005,8 @@ function chatMessageEl(msg) {
 
   const bubble = chatEl("div", "chat-bubble");
   if (msg.reply_to) bubble.appendChild(chatReplyEl(msg.reply_to));
-  bubble.appendChild(chatEl("div", "chat-text", msg.text));
+  if (msg.image) bubble.appendChild(pixelArtEl(msg.image));
+  else bubble.appendChild(chatEl("div", "chat-text", msg.text));
   if (msg.emoji_only) bubble.classList.add("chat-emoji-only");
   appendChatReactions(bubble, msg.reactions);
 

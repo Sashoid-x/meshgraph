@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import time
 
 from meshgraph import chat, store
@@ -341,3 +342,128 @@ def test_is_emoji_only_rejects_ordinary_text():
     assert not chat.is_emoji_only("привет 👍")
     assert not chat.is_emoji_only("👍 ok")
     assert not chat.is_emoji_only("10/10")
+
+
+# ---------------------------------------------------------------------------
+# Pixel art (PRIVATE_APP)
+# ---------------------------------------------------------------------------
+
+from .test_pixelart import GOLDEN_PAYLOAD  # noqa: E402
+
+
+def add_art(
+    settings,
+    *,
+    packet_id: int | None = None,
+    from_node: int = 1,
+    ts: float | None = None,
+    gateway: int = 2,
+    to: int = 0xFFFFFFFF,
+    channel: str = "LongFast",
+    payload: bytes = GOLDEN_PAYLOAD,
+    reply_id: int | None = None,
+    emoji: int | None = None,
+):
+    """Вставить PRIVATE_APP-пакет так, как его записал бы декодер."""
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            timestamp=ts,
+            from_node_id=from_node,
+            to_node_id=to,
+            portnum_name="PRIVATE_APP",
+            gateway_node_id=gateway,
+            channel_id=channel,
+            raw_payload=payload,
+            mesh_packet_id=packet_id,
+            reply_id=reply_id,
+            emoji=emoji,
+        ),
+    )
+
+
+def test_pixel_art_enters_the_chat(settings):
+    add_node(settings, 42, "Художник")
+    add_art(settings, packet_id=501, from_node=42, ts=NOW - 30)
+
+    message = chat.build_chat(settings, hours=24)["messages"][0]
+
+    assert message["name"] == "Художник"
+    assert message["text"] == ""
+    assert message["emoji_only"] is False
+    assert message["reply_to"] is None
+    image = message["image"]
+    assert (image["w"], image["h"], image["theme"], image["grid"]) == (32, 48, 8, False)
+    assert len(base64.b64decode(image["bits"])) == 192
+
+
+def test_pixel_art_and_text_share_one_flow(settings):
+    add_text(settings, "до картинки", packet_id=1, ts=NOW - 120)
+    add_art(settings, packet_id=2, ts=NOW - 60)
+    add_text(settings, "после", packet_id=3, ts=NOW - 30)
+
+    messages = chat.build_chat(settings, hours=24)["messages"]
+
+    assert len(messages) == 3
+    assert [m["image"] is not None for m in messages] == [False, True, False]
+
+
+def test_receptions_of_pixel_art_collapse(settings):
+    add_art(settings, packet_id=501, ts=NOW - 100, gateway=7)
+    add_art(settings, packet_id=501, ts=NOW - 90, gateway=8)
+
+    messages = chat.build_chat(settings, hours=24)["messages"]
+
+    assert len(messages) == 1
+    assert messages[0]["ts"] == NOW - 100  # как у текста: earliest reception
+
+
+def test_private_traffic_without_art_stays_out(settings):
+    add_art(settings, packet_id=601, payload=b"MFT\x01" + b"\x00" * 20)
+    add_art(settings, packet_id=602, payload=b"\x73\x00")
+
+    assert chat.build_chat(settings, hours=24)["messages"] == []
+
+
+def test_direct_pixel_art_is_not_channel_chat(settings):
+    add_art(settings, packet_id=701, to=42)
+
+    assert chat.build_chat(settings, hours=24)["messages"] == []
+
+
+def test_pixel_art_respects_the_time_window(settings):
+    add_art(settings, packet_id=801, ts=NOW - 48 * 3600)
+
+    assert chat.build_chat(settings, hours=24)["messages"] == []
+
+
+def test_pixel_art_respects_the_channel_filter(settings):
+    add_art(settings, packet_id=851, channel="TM")
+
+    assert chat.build_chat(settings, hours=24, channel="LongFast")["messages"] == []
+    assert len(chat.build_chat(settings, hours=24, channel="TM")["messages"]) == 1
+
+
+def test_reply_to_pixel_art_quotes_its_size(settings):
+    add_art(settings, packet_id=901, ts=NOW - 120)
+    add_text(settings, "красиво!", packet_id=902, ts=NOW - 60, reply_id=901)
+
+    messages = chat.build_chat(settings, hours=24)["messages"]
+
+    assert len(messages) == 2
+    assert messages[0]["image"] is not None
+    assert messages[1]["reply_to"]["text"] == "пиксель-арт 32×48"
+
+
+def test_pixel_art_is_never_a_reaction(settings):
+    # Флаг emoji на пакете с картинкой: такая строка обязана остаться
+    # полноценным сообщением, а не реакцией с пустым эмодзи.
+    add_text(settings, "цель", packet_id=999, ts=NOW - 120)
+    add_art(settings, packet_id=1001, ts=NOW - 60, reply_id=999, emoji=1)
+
+    messages = chat.build_chat(settings, hours=24)["messages"]
+
+    assert len(messages) == 2
+    art = next(m for m in messages if m["image"])
+    assert art["reply_to"]["text"] == "цель"
+    assert all(m["reactions"] is None for m in messages)

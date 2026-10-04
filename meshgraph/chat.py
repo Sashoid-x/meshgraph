@@ -1,4 +1,4 @@
-"""Channel chat: text messages with threaded replies and emoji reactions.
+"""Channel chat: text and pixel-art messages with replies and reactions.
 
 Meshtastic carries chat as ``TEXT_MESSAGE_APP`` packets.  Two fields of the
 inner ``Data`` protobuf turn that into a messenger:
@@ -15,6 +15,11 @@ Gateways hear the same broadcast independently, so one message usually
 arrives several times with different RSSI.  Receptions are merged by
 (sender, packet id), keeping the earliest one.  Only broadcast messages are
 chat: a direct message addressed to a node is not part of the channel.
+
+Pixel art rides the same channel on ``PRIVATE_APP``: the payload *is* the
+picture (header byte, compressed bits, palette trailer — see
+``meshgraph/pixelart.py``).  Such rows enter the flow like any other
+message and carry an ``image`` field instead of text.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from . import store
+from . import pixelart, store
 from .config import Settings
 from .graph import display_name, sanitize_hours
 from .traceroute import BROADCAST_NODE_ID
@@ -64,11 +69,26 @@ _EMOJI_RANGES = (
 _EMOJI_GLUE = frozenset("\u200d\ufe0e\ufe0f\u20e3")  # ZWJ, variation, keycap
 _KEYCAP_BASE = frozenset("#*0123456789")
 
-_SELECT_TEXT = """
-    SELECT id, timestamp, from_node_id, to_node_id, mesh_packet_id,
-           channel_id, reply_id, emoji, raw_payload
+_COLUMNS = """
+    id, timestamp, from_node_id, to_node_id, mesh_packet_id,
+    channel_id, portnum_name, reply_id, emoji, raw_payload
+"""
+
+_SELECT_TEXT = f"""
+    SELECT {_COLUMNS}
     FROM packets
     WHERE portnum_name = 'TEXT_MESSAGE_APP'
+      AND processed = 1
+      AND (to_node_id IS NULL OR to_node_id = ?)
+"""
+
+# Пиксель-арт едет тем же широковещанием, но своим портом: полезный груз
+# целиком лежит в raw_payload, поэтому картинки собираются отдельным
+# запросом и схлопываются с текстом по (отправитель, id пакета).
+_SELECT_PIXEL_ART = f"""
+    SELECT {_COLUMNS}
+    FROM packets
+    WHERE portnum_name = 'PRIVATE_APP'
       AND processed = 1
       AND (to_node_id IS NULL OR to_node_id = ?)
 """
@@ -105,7 +125,23 @@ def is_emoji_only(text: str) -> bool:
     return True
 
 
-def _row_to_message(row: Any) -> dict[str, Any]:
+def _row_to_message(row: Any) -> dict[str, Any] | None:
+    if row["portnum_name"] == "PRIVATE_APP":
+        image = pixelart.decode(row["raw_payload"] or b"")
+        if image is None:
+            return None  # чужой приватный трафик (MFT и прочее) — не чат
+        return {
+            "id": row["id"],
+            "packet_id": row["mesh_packet_id"] or None,
+            "ts": row["timestamp"],
+            "from": row["from_node_id"],
+            "channel": row["channel_id"],
+            "text": "",
+            "image": image,
+            "emoji_only": False,
+            "_reply_id": row["reply_id"] or None,
+            "_emoji": row["emoji"],
+        }
     text = _clean_text(row["raw_payload"] or b"")
     return {
         "id": row["id"],
@@ -124,9 +160,12 @@ def _remember(
     messages: dict[tuple, dict[str, Any]], key: tuple, row: Any
 ) -> None:
     """Store a reception, keeping the earliest one for the same message."""
+    message = _row_to_message(row)
+    if message is None:
+        return  # приватная строка без валидного пиксель-арта
     existing = messages.get(key)
     if existing is None or row["timestamp"] < existing["ts"]:
-        messages[key] = _row_to_message(row)
+        messages[key] = message
 
 
 def _aggregate_reactions(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -193,16 +232,19 @@ def build_chat(
     channel = (channel or "").strip() or None
     since = time.time() - hours * 3600
 
-    sql = _SELECT_TEXT + " AND timestamp >= ?"
-    params: list[Any] = [BROADCAST_NODE_ID, since]
-    if channel:
-        sql += " AND channel_id = ?"
-        params.append(channel)
-    sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
-    # Запас на дубли приёмов: в окне должно поместиться `limit` сообщений,
-    # а не строк (одно сообщение слышат несколько шлюзов сразу).
-    params.append(limit * 3)
-    rows = store.query(settings.db_file, sql, params)
+    def select(base_sql: str) -> list[Any]:
+        sql = base_sql + " AND timestamp >= ?"
+        params: list[Any] = [BROADCAST_NODE_ID, since]
+        if channel:
+            sql += " AND channel_id = ?"
+            params.append(channel)
+        sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        # Запас на дубли приёмов: в окне должно поместиться `limit` сообщений,
+        # а не строк (одно сообщение слышат несколько шлюзов сразу).
+        params.append(limit * 3)
+        return store.query(settings.db_file, sql, params)
+
+    rows = select(_SELECT_TEXT) + select(_SELECT_PIXEL_ART)
 
     # One message, many receptions: keep the earliest row per (sender, id).
     messages: dict[tuple, dict[str, Any]] = {}
@@ -227,14 +269,15 @@ def build_chat(
     missing = referenced - have
     if missing:
         placeholders = ",".join("?" for _ in missing)
-        target_sql = _SELECT_TEXT + f" AND mesh_packet_id IN ({placeholders})"
-        target_params: list[Any] = [BROADCAST_NODE_ID, *sorted(missing)]
-        if channel:
-            target_sql += " AND channel_id = ?"
-            target_params.append(channel)
-        for row in store.query(settings.db_file, target_sql, target_params):
-            key = ("p", row["from_node_id"], row["mesh_packet_id"])
-            _remember(messages, key, row)
+        for base_sql in (_SELECT_TEXT, _SELECT_PIXEL_ART):
+            target_sql = base_sql + f" AND mesh_packet_id IN ({placeholders})"
+            target_params: list[Any] = [BROADCAST_NODE_ID, *sorted(missing)]
+            if channel:
+                target_sql += " AND channel_id = ?"
+                target_params.append(channel)
+            for row in store.query(settings.db_file, target_sql, target_params):
+                key = ("p", row["from_node_id"], row["mesh_packet_id"])
+                _remember(messages, key, row)
 
     # Names for every author, including the ones quoted from outside the
     # window (their author may differ from the replier).
@@ -257,7 +300,11 @@ def build_chat(
     plain: list[dict[str, Any]] = []
     for msg in messages.values():
         target = msg["_reply_id"]
-        is_reaction = bool(target) and (bool(msg["_emoji"]) or msg["emoji_only"])
+        is_reaction = (
+            bool(target)
+            and not msg.get("image")  # картинка — не эмодзи-реакция
+            and (bool(msg["_emoji"]) or msg["emoji_only"])
+        )
         if is_reaction:
             reaction_buckets.setdefault(target, []).append(msg)
         else:
@@ -269,11 +316,15 @@ def build_chat(
             continue
         target_msg = messages_by_pid.get(target_id)
         if target_msg is not None:
+            target_text = target_msg["text"]
+            if not target_text and target_msg.get("image"):
+                picture = target_msg["image"]
+                target_text = f"пиксель-арт {picture['w']}×{picture['h']}"
             msg["reply_to"] = {
                 "packet_id": target_id,
                 "from": target_msg["from"],
                 "name": target_msg["name"],
-                "text": target_msg["text"],
+                "text": target_text,
                 "ts": target_msg["ts"],
             }
         else:
@@ -307,6 +358,7 @@ def build_chat(
                 "hex_id": m["hex_id"],
                 "channel": m["channel"],
                 "text": m["text"],
+                "image": m.get("image"),
                 "emoji_only": m["emoji_only"],
                 "phantom": bool(m.get("phantom")),
                 "reply_to": m.get("reply_to"),

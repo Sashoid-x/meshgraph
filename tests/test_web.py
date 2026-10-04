@@ -122,6 +122,42 @@ def test_theme_toggle(client):
     assert "storeSet(THEME_KEY, theme)" in app_js  # выбор запоминается
 
 
+def test_chat_endpoint_carries_pixel_art(client):
+    from .test_pixelart import GOLDEN_PAYLOAD
+
+    db_file = client.application.extensions["meshgraph_settings"].get().db_file
+    store.insert_packet(
+        db_file,
+        make_packet(
+            from_node_id=NODE_A,
+            portnum_name="PRIVATE_APP",
+            mesh_packet_id=78,
+            raw_payload=GOLDEN_PAYLOAD,
+        ),
+    )
+
+    payload = client.get("/api/chat?hours=24").get_json()
+
+    message = payload["messages"][0]
+    assert message["text"] == ""
+    image = message["image"]
+    assert (image["w"], image["h"], image["theme"], image["grid"]) == (32, 48, 8, False)
+
+
+def test_page_wires_pixel_art(client):
+    body = client.get("/").get_data(as_text=True)
+    assert "pixelart.js" in body
+
+    root = Path(__file__).resolve().parents[1] / "meshgraph"
+    app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function pixelArtEl(" in app_js
+    assert "MESHGRAPH_PIXEL_PALETTES" in app_js
+    assert "m.image" in app_js  # подпись чата учитывает картинку
+
+    pixel_js = (root / "static" / "pixelart.js").read_text(encoding="utf-8")
+    assert pixel_js.count("name:") == 24  # все палитры на месте
+
+
 # ---------------------------------------------------------------------------
 # Graph API
 # ---------------------------------------------------------------------------
