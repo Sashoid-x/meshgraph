@@ -33,6 +33,15 @@ DEDUP_WINDOW_SECONDS = 600.0
 # instead of waiting for a TTL.
 _generation = 0
 
+# Process-lifetime totals surfaced in /api/graph stats (G-P2-1).
+_counters = {"packets_deduplicated": 0, "packets_pruned_total": 0}
+
+
+def counters() -> dict[str, int]:
+    """Totals since this process started; safe to call from any thread."""
+    with _lock:
+        return dict(_counters)
+
 
 def generation() -> int:
     """Packet-data generation; bumps on every committed insert or prune."""
@@ -248,6 +257,7 @@ def insert_packet(db_file: str, packet: DecodedPacket) -> bool:
         conn = _connect(db_file)
         try:
             if _is_duplicate_reception(conn, packet):
+                _counters["packets_deduplicated"] += 1
                 return False
             row = packet.to_row()
             row["processed"] = 1 if packet.processed else 0
@@ -337,6 +347,7 @@ def prune(db_file: str, retention_hours: int) -> int:
                 )
             conn.commit()
             if deleted:
+                _counters["packets_pruned_total"] += deleted
                 _bump_generation()
                 logger.info("Pruned %s packets older than %sh", deleted, retention_hours)
             return deleted

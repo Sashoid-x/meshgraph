@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -654,3 +655,256 @@ def test_insert_invalidates_cached_payload_immediately(settings):
     # Unchanged data → same key → the cached object is served again.
     third = graph.build_graph(settings, mode="traceroute", use_cache=True)
     assert third is second
+
+
+# ---------------------------------------------------------------------------
+# Measurement honesty and telemetry (G-P1-3, G-P1-4, G-P2-1, G-P2-3)
+# ---------------------------------------------------------------------------
+
+
+def test_traceroute_separates_injected_zero_from_implausible_snr(settings):
+    # A-B entered over MQTT/UDP (snr exactly 0), X-Y carries40 dB junk.
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            to_node_id=B,
+            portnum_name="TRACEROUTE_APP",
+            raw_payload=_route_payload(route=[], snr_towards=[0]),
+        ),
+    )
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=X,
+            to_node_id=Y,
+            portnum_name="TRACEROUTE_APP",
+            raw_payload=_route_payload(route=[], snr_towards=[160]),  # 40 dB
+        ),
+    )
+
+    payload = graph.build_graph(settings, mode="traceroute", use_cache=False)
+    stats = payload["stats"]
+
+    # Different reasons, different counters: nothing is lumped together.
+    assert stats["links_filtered_due_to_snr_0"] == 1  # the injected "hop"
+    assert stats["links_filtered_by_snr"] == 1        # the out-of-range value
+    assert stats["links_found"] == 0
+
+
+def test_rssi_distinguishes_injected_zero_from_unknown_snr(settings):
+    # Two receptions of different pairs: one has the fake 0 dB, one no SNR.
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            gateway_node_id=GATEWAY,
+            snr=0.0,
+            rssi=-80,
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+        ),
+    )
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=X,
+            gateway_node_id=GATEWAY,
+            snr=None,
+            rssi=-70,
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+        ),
+    )
+
+    payload = graph.build_graph(settings, mode="rssi", use_cache=False)
+    stats = payload["stats"]
+    links = {(l["source"], l["target"]): l for l in payload["links"]}
+
+    # Each case landed in its own counter, not a shared one.
+    assert stats["receptions_snr_injected"] == 1
+    assert stats["receptions_snr_unknown"] == 1
+    assert stats["receptions_plausible"] == 2
+    # The fake zero is not averaged in: the links keep only their RSSI.
+    assert links[(A, GATEWAY)]["avg_snr"] is None
+    assert links[(A, GATEWAY)]["avg_rssi"] == -80.0
+    assert links[(GATEWAY, X)]["avg_snr"] is None
+    assert links[(GATEWAY, X)]["avg_rssi"] == -70.0
+
+
+def test_rssi_filter_reasons_do_not_mix(settings):
+    # One row has no measurements at all; the other fails the min_snr filter.
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            gateway_node_id=GATEWAY,
+            snr=None,
+            rssi=0,  # 0 is the "not provided" sentinel
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+        ),
+    )
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=X,
+            gateway_node_id=GATEWAY,
+            snr=3.0,
+            rssi=-70,
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+        ),
+    )
+
+    payload = graph.build_graph(settings, mode="rssi", min_snr=5, use_cache=False)
+    stats = payload["stats"]
+
+    assert stats["links_filtered_no_signal"] == 1
+    assert stats["links_filtered_below_min_snr"] == 1
+    assert stats["links_filtered"] == 2  # итог остаётся суммой причин
+    assert payload["links"] == []
+
+
+def test_bad_snr_row_is_counted_not_fatal(settings):
+    # A string in the REAL column makes is_plausible_snr raise: without the
+    # row guard the whole build would die on the first row (G-P1-4).
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            gateway_node_id=GATEWAY,
+            snr="junk",
+            rssi=-80,
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+            timestamp=time.time(),  # newer → processed first (ORDER BY DESC)
+        ),
+    )
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=X,
+            gateway_node_id=GATEWAY,
+            snr=10.0,
+            rssi=-70,
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+            timestamp=time.time() - 60,
+        ),
+    )
+
+    payload = graph.build_graph(settings, mode="rssi", use_cache=False)
+
+    assert payload["stats"]["row_errors"] == 1
+    assert payload["stats"]["receptions_analyzed"] == 2
+    # The healthy row after the broken one still produced its link.
+    assert {(l["source"], l["target"]) for l in payload["links"]} == {(GATEWAY, X)}
+
+
+def test_truncated_flag_honours_the_limit(settings):
+    for node in (A, X):
+        store.insert_packet(
+            settings.db_file,
+            make_packet(
+                from_node_id=node,
+                gateway_node_id=GATEWAY,
+                snr=7.0,
+                rssi=-75,
+                hop_limit=3,
+                hop_start=3,
+                portnum_name="TELEMETRY_APP",
+            ),
+        )
+
+    capped = graph.build_graph(settings, mode="rssi", limit=1, use_cache=False)
+    stats = capped["stats"]
+
+    assert stats["truncated"] is True
+    assert stats["rows_considered"] == 2  # saw one row past the limit
+    assert stats["receptions_analyzed"] == 1  # showed only the limit
+
+    full = graph.build_graph(settings, mode="rssi", limit=100, use_cache=False)
+    assert full["stats"]["truncated"] is False
+    assert full["stats"]["rows_considered"] == 2
+
+
+def test_graph_response_carries_no_raw_payload(seeded):
+    for mode in ("traceroute", "rssi", "combined"):
+        payload = graph.build_graph(seeded, mode=mode, use_cache=False)
+        assert "raw_payload" not in json.dumps(payload, ensure_ascii=False), mode
+
+
+def test_cache_and_store_counters_are_reported(settings):
+    first = graph.build_graph(settings, mode="traceroute", use_cache=True)
+
+    assert "packets_deduplicated" in first["stats"]
+    assert "packets_pruned_total" in first["stats"]
+    assert first["stats"]["snr_scope"] == "both"
+    misses, hits = first["stats"]["cache_misses"], first["stats"]["cache_hits"]
+
+    second = graph.build_graph(settings, mode="traceroute", use_cache=True)
+    assert second is first  # same key — nothing was recomputed
+    assert second["stats"]["cache_misses"] == misses
+    assert second["stats"]["cache_hits"] == hits + 1
+
+
+def test_node_snr_counts_both_ends_of_every_hop(settings):
+    # A→B→C→D: the old code let each node see only its outgoing hops.
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            to_node_id=D,
+            portnum_name="TRACEROUTE_APP",
+            raw_payload=_route_payload(
+                route=[B, C], snr_towards=[40, 44, 48]
+            ),  # 10, 11, 12 dB
+        ),
+    )
+
+    payload = graph.build_graph(settings, mode="traceroute", use_cache=False)
+    by_id = {n["id"]: n for n in payload["nodes"]}
+
+    assert by_id[A]["avg_snr"] == 10.0  # only A→B touches A from the front
+    assert by_id[B]["avg_snr"] == 10.5  # (10 + 11) / 2 — both hops with B
+    assert by_id[C]["avg_snr"] == 11.5  # (11 + 12) / 2
+    assert by_id[D]["avg_snr"] == 12.0  # used to be None
+
+
+def test_node_snr_does_not_jump_when_the_mode_changes(settings):
+    # The same A pair seen once as a traceroute hop and once as a reception.
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            to_node_id=B,
+            portnum_name="TRACEROUTE_APP",
+            raw_payload=_route_payload(route=[], snr_towards=[30]),  # 7.5 dB
+        ),
+    )
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            gateway_node_id=GATEWAY,
+            snr=7.5,
+            rssi=-80,
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+        ),
+    )
+
+    traceroute = graph.build_graph(settings, mode="traceroute", use_cache=False)
+    rssi = graph.build_graph(settings, mode="rssi", use_cache=False)
+    t_node = {n["id"]: n for n in traceroute["nodes"]}[A]
+    r_node = {n["id"]: n for n in rssi["nodes"]}[A]
+
+    assert t_node["avg_snr"] == r_node["avg_snr"] == 7.5

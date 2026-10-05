@@ -367,3 +367,45 @@ def test_graph_failure_returns_json_500(settings_store, tmp_path, monkeypatch):
 
     assert response.status_code == 500
     assert response.get_json() == {"error": "internal error"}
+
+
+def test_graph_api_reports_truncation_and_counters(client):
+    """stats must be honest about the row limit (G-P2-1)."""
+    from meshgraph import graph
+
+    db_file = client.application.extensions["meshgraph_settings"].get().db_file
+    # A second direct reception: the seed already holds one.
+    store.insert_packet(
+        db_file,
+        make_packet(
+            from_node_id=NODE_A,
+            gateway_node_id=GATEWAY,
+            snr=9.0,
+            rssi=-71,
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+        ),
+    )
+    graph.invalidate_cache()
+    settings = client.application.extensions["meshgraph_settings"]
+    settings.update(graph_packet_limit=1)
+
+    stats = client.get("/api/graph?mode=rssi").get_json()["stats"]
+
+    assert stats["truncated"] is True
+    assert stats["rows_considered"] == 2  # saw one row past the limit
+    assert stats["receptions_analyzed"] == 1  # showed only the limit
+    # Process-wide telemetry rides along in every response.
+    assert "packets_deduplicated" in stats
+    assert "packets_pruned_total" in stats
+    assert "cache_hits" in stats and "cache_misses" in stats
+    assert stats["snr_scope"] == "both"
+
+
+def test_page_wires_the_truncation_hint(client):
+    root = Path(__file__).resolve().parents[1] / "meshgraph"
+    app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    html = (root / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "stTruncated" in app_js  # предупреждение выводится из stats
+    assert 'id="stTruncated"' in html  # и для него есть элемент

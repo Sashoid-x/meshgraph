@@ -31,6 +31,8 @@ from . import store
 from .config import GRAPH_MODES, Settings
 from .traceroute import (
     BROADCAST_NODE_ID,
+    SNR_INJECTED,
+    SNR_UNKNOWN,
     build_rf_hops,
     is_plausible_rssi,
     is_plausible_snr,
@@ -47,6 +49,9 @@ _cache_lock = threading.Lock()
 # Single-flight: keys currently being rebuilt -> the event waiters block on
 # until the leader publishes its result (or fails).
 _inflight: dict[str, threading.Event] = {}
+
+# Cumulative cache telemetry, mirrored into every /api/graph stats block.
+_cache_stats = {"hits": 0, "misses": 0}
 
 
 def _cache_fresh_locked(key: str) -> dict | None:
@@ -85,6 +90,12 @@ def _strength(avg_snr: float | None, avg_rssi: float | None, packet_count: int) 
 
 def _node_size(packet_count: int) -> float:
     return round(min(20, max(5, math.log10(packet_count + 1) * 3)), 1)
+
+
+def _count_row_error(stats: dict[str, Any], row_id: Any, exc: Exception) -> None:
+    """One malformed row must never abort a whole build; count it for the UI."""
+    stats["row_errors"] = stats.get("row_errors", 0) + 1
+    logger.warning("Error processing packet %s: %s", row_id, exc)
 
 
 def display_name(info: dict[str, Any] | None, node_id: int) -> str:
@@ -161,9 +172,15 @@ def _build_traceroute(
         sql += " AND channel_id = ?"
         params.append(channel)
     sql += " ORDER BY timestamp DESC LIMIT ?"
-    params.append(limit)
+    params.append(limit + 1)
 
     packets = store.query(settings.db_file, sql, params)
+    # Fetch one row past the limit: its presence proves the window does not
+    # fit, so the sidebar can say so instead of pretending (G-P2-1).
+    rows_considered = len(packets)
+    truncated = rows_considered > limit
+    if truncated:
+        packets = packets[:limit]
 
     nodes: dict[int, dict[str, Any]] = {}
     direct_links: dict[tuple[int, int], dict[str, Any]] = {}
@@ -172,11 +189,14 @@ def _build_traceroute(
     stats: dict[str, Any] = {
         "mode": "traceroute",
         "packets_analyzed": len(packets),
+        "rows_considered": rows_considered,
+        "truncated": truncated,
         "packets_with_rf_hops": 0,
         "total_rf_hops": 0,
         "links_found": 0,
         "links_filtered_by_snr": 0,
         "links_filtered_due_to_snr_0": 0,
+        "row_errors": 0,
     }
 
     def touch(node_id: int, timestamp: float) -> None:
@@ -205,14 +225,16 @@ def _build_traceroute(
             stats["total_rf_hops"] += len(rf_hops)
 
             for hop_from, hop_to, snr in rf_hops:
+                if snr == SNR_INJECTED:
+                    # Exactly 0 dB is an MQTT/UDP injected link, not an RF
+                    # hop: a fake measurement, unlike a missing one (G-P1-3).
+                    # Checked before min_snr so the reason never blends in.
+                    stats["links_filtered_due_to_snr_0"] += 1
+                    continue
                 if not is_plausible_traceroute_snr(snr) or (
                     min_snr != -200 and snr < min_snr
                 ):
                     stats["links_filtered_by_snr"] += 1
-                    continue
-                if snr == 0:
-                    # snr == 0 marks an MQTT/UDP injected link, not an RF hop.
-                    stats["links_filtered_due_to_snr_0"] += 1
                     continue
                 if BROADCAST_NODE_ID in (hop_from, hop_to):
                     continue
@@ -241,8 +263,13 @@ def _build_traceroute(
 
                 nodes[hop_from]["connections"].add(hop_to)
                 nodes[hop_to]["connections"].add(hop_from)
+                # Both ends live through the same hop: counting it for both
+                # keeps a node's avg_snr comparable across modes (G-P2-3,
+                # stats.snr_scope = "both").
                 nodes[hop_from]["total_snr"] += snr
                 nodes[hop_from]["snr_count"] += 1
+                nodes[hop_to]["total_snr"] += snr
+                nodes[hop_to]["snr_count"] += 1
 
             if include_indirect and len(rf_hops) > 1:
                 first_hop, last_hop = rf_hops[0], rf_hops[-1]
@@ -277,7 +304,7 @@ def _build_traceroute(
                         conn["last_seen"] = max(conn["last_seen"], row["timestamp"])
 
         except Exception as exc:  # noqa: BLE001 - one bad packet must not abort
-            logger.warning("Error processing traceroute packet %s: %s", row["id"], exc)
+            _count_row_error(stats, row.get("id"), exc)
             continue
 
     processed_links = []
@@ -364,7 +391,11 @@ def _build_rssi(
         + " AND hop_start IS NOT NULL AND hop_limit IS NOT NULL AND hop_start = hop_limit"
         + " ORDER BY timestamp DESC LIMIT ?"
     )
-    rows = store.query(settings.db_file, sql, [*common_params, limit])
+    rows = store.query(settings.db_file, sql, [*common_params, limit + 1])
+    rows_considered = len(rows)
+    truncated = rows_considered > limit
+    if truncated:
+        rows = rows[:limit]
 
     relayed_sql = (
         "SELECT COUNT(*) AS n FROM packets "
@@ -380,10 +411,18 @@ def _build_rssi(
     stats: dict[str, Any] = {
         "mode": "rssi",
         "receptions_analyzed": len(rows),
+        "rows_considered": rows_considered,
+        "truncated": truncated,
         "receptions_relayed": relayed_count,
         "receptions_plausible": 0,
+        "receptions_snr_injected": 0,
+        "receptions_snr_unknown": 0,
         "links_found": 0,
         "links_filtered": 0,
+        # Reasons stay separate so the sidebar never lumps them together.
+        "links_filtered_no_signal": 0,
+        "links_filtered_below_min_snr": 0,
+        "row_errors": 0,
     }
 
     def touch(node_id: int, timestamp: float, snr: float | None, rssi: float | None):
@@ -405,46 +444,64 @@ def _build_rssi(
             node["rssi_values"].append(rssi)
 
     for row in rows:
-        snr = float(row["snr"]) if is_plausible_snr(row["snr"]) else None
-        rssi = float(row["rssi"]) if is_plausible_rssi(row["rssi"]) else None
+        try:
+            raw_snr = row["snr"]
+            if raw_snr == SNR_INJECTED:
+                # Exactly 0 dB is an MQTT/UDP injected reception: a fake
+                # measurement (G-P1-3), kept out of every average.
+                snr = SNR_UNKNOWN
+                stats["receptions_snr_injected"] += 1
+            elif is_plausible_snr(raw_snr):
+                snr = float(raw_snr)
+            else:
+                # NULL or out of range: there is no usable measurement.
+                snr = SNR_UNKNOWN
+                stats["receptions_snr_unknown"] += 1
+            rssi = float(row["rssi"]) if is_plausible_rssi(row["rssi"]) else None
 
-        if snr is None and rssi is None:
-            stats["links_filtered"] += 1
+            if snr is None and rssi is None:
+                # No measurement at all — its own reason, not a filter hit.
+                stats["links_filtered"] += 1
+                stats["links_filtered_no_signal"] += 1
+                continue
+            if min_snr != -200 and (snr is None or snr < min_snr):
+                stats["links_filtered"] += 1
+                stats["links_filtered_below_min_snr"] += 1
+                continue
+
+            stats["receptions_plausible"] += 1
+
+            gateway_id = int(row["gateway_node_id"])
+            from_id = int(row["from_node_id"])
+            link_key = tuple(sorted((gateway_id, from_id)))
+
+            touch(gateway_id, row["timestamp"], snr, rssi)
+            touch(from_id, row["timestamp"], snr, rssi)
+            nodes[gateway_id]["connections"].add(from_id)
+            nodes[from_id]["connections"].add(gateway_id)
+
+            link = links_raw.get(link_key)
+            if link is None:
+                links_raw[link_key] = {
+                    "source": link_key[0],
+                    "target": link_key[1],
+                    "snr_values": [snr] if snr is not None else [],
+                    "rssi_values": [rssi] if rssi is not None else [],
+                    "packet_count": 1,
+                    "last_seen": row["timestamp"],
+                }
+                stats["links_found"] += 1
+            else:
+                link["packet_count"] += 1
+                if snr is not None:
+                    link["snr_values"].append(snr)
+                if rssi is not None:
+                    link["rssi_values"].append(rssi)
+                if row["timestamp"] > link["last_seen"]:
+                    link["last_seen"] = row["timestamp"]
+        except Exception as exc:  # noqa: BLE001 - one bad row must not abort
+            _count_row_error(stats, row.get("id"), exc)
             continue
-        if min_snr != -200 and (snr is None or snr < min_snr):
-            stats["links_filtered"] += 1
-            continue
-
-        stats["receptions_plausible"] += 1
-
-        gateway_id = int(row["gateway_node_id"])
-        from_id = int(row["from_node_id"])
-        link_key = tuple(sorted((gateway_id, from_id)))
-
-        touch(gateway_id, row["timestamp"], snr, rssi)
-        touch(from_id, row["timestamp"], snr, rssi)
-        nodes[gateway_id]["connections"].add(from_id)
-        nodes[from_id]["connections"].add(gateway_id)
-
-        link = links_raw.get(link_key)
-        if link is None:
-            links_raw[link_key] = {
-                "source": link_key[0],
-                "target": link_key[1],
-                "snr_values": [snr] if snr is not None else [],
-                "rssi_values": [rssi] if rssi is not None else [],
-                "packet_count": 1,
-                "last_seen": row["timestamp"],
-            }
-            stats["links_found"] += 1
-        else:
-            link["packet_count"] += 1
-            if snr is not None:
-                link["snr_values"].append(snr)
-            if rssi is not None:
-                link["rssi_values"].append(rssi)
-            if row["timestamp"] > link["last_seen"]:
-                link["last_seen"] = row["timestamp"]
 
     processed_links = []
     for link in links_raw.values():
@@ -582,6 +639,10 @@ def _build_combined(
         "total_rf_hops": trace_stats.get("total_rf_hops", 0),
         "links_filtered": rssi_stats.get("links_filtered", 0),
         "links_filtered_by_snr": trace_stats.get("links_filtered_by_snr", 0),
+        "row_errors": trace_stats.get("row_errors", 0) + rssi_stats.get("row_errors", 0),
+        "rows_considered": trace_stats.get("rows_considered", 0)
+        + rssi_stats.get("rows_considered", 0),
+        "truncated": bool(trace_stats.get("truncated") or rssi_stats.get("truncated")),
         "traceroute": trace_stats,
         "rssi": rssi_stats,
         "nodes": len(nodes),
@@ -738,8 +799,17 @@ def build_graph(
             settings, hours, min_snr, include_indirect, channel, limit
         )
 
+    def finish(payload: dict[str, Any]) -> dict[str, Any]:
+        # Request-path and process-wide telemetry added to every response, so
+        # the sidebar gets it without mode-specific plumbing (G-P2-1).
+        payload["stats"]["cache_hits"] = _cache_stats["hits"]
+        payload["stats"]["cache_misses"] = _cache_stats["misses"]
+        payload["stats"]["snr_scope"] = "both"
+        payload["stats"].update(store.counters())
+        return payload
+
     if not use_cache:
-        return compute()
+        return finish(compute())
 
     # Single-flight: the first thread on a key becomes the leader and
     # computes; everyone else waits for its event and re-checks the cache
@@ -747,12 +817,15 @@ def build_graph(
     while True:
         with _cache_lock:
             cached = _cache_fresh_locked(cache_key)
-            if cached is not None:
-                return cached
-            event = _inflight.get(cache_key)
-            if event is None:
-                _inflight[cache_key] = event = threading.Event()
-                break
+            if cached is None:
+                event = _inflight.get(cache_key)
+                if event is None:
+                    _inflight[cache_key] = event = threading.Event()
+                    _cache_stats["misses"] += 1
+                    break
+        if cached is not None:
+            _cache_stats["hits"] += 1
+            return finish(cached)
         event.wait()
 
     try:
@@ -771,7 +844,7 @@ def build_graph(
             _cache.pop(next(iter(_cache)))
         _inflight.pop(cache_key, None)
     event.set()
-    return payload
+    return finish(payload)
 
 
 def invalidate_cache() -> None:

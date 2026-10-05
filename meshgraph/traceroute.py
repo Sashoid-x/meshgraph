@@ -20,6 +20,13 @@ SNR_PLAUSIBLE_MAX = 30.0
 # RouteDiscovery encodes "SNR unknown" as INT8_MIN, which scales to -32.0 dB.
 TRACEROUTE_UNKNOWN_SNR = -32.0
 
+# Two different reasons a hop can lack a usable SNR — never mix them up
+# (G-P1-3).  SNR_INJECTED is exactly 0.0 dB: the "hop" travelled over
+# MQTT/UDP, no RF link existed, so the value is fake.  SNR_UNKNOWN is the
+# plain absence of a measurement (NULL in the database).
+SNR_INJECTED = 0.0
+SNR_UNKNOWN: float | None = None
+
 # Meshtastic broadcast / invalid node id.
 BROADCAST_NODE_ID = 0xFFFFFFFF
 

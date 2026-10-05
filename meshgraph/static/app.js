@@ -160,6 +160,12 @@ function updateStats(data) {
       ? "—"
       : fmtNum(stats.receptions_relayed);
   $("stUpdated").textContent = new Date().toLocaleTimeString();
+  // SQL-лимит мог отбросить старшие строки окна — говорим об этом явно.
+  const truncated = $("stTruncated");
+  truncated.hidden = !stats.truncated;
+  truncated.textContent = stats.truncated
+    ? `⚠ Строк больше лимита: показаны свежайшие ${fmtNum(stats.packets_analyzed)} пакетов`
+    : "";
 }
 
 // ---------------------------------------------------------------------------

@@ -339,3 +339,36 @@ def test_node_lookup_chunks_large_id_lists(settings, monkeypatch):
     monkeypatch.setattr(store, "NODE_LOOKUP_CHUNK", 7)
     assert store.node_lookup(settings.db_file, ids) == found
     assert store.node_lookup(settings.db_file, []) == {}
+
+
+def test_counters_track_dedup_and_prune(settings):
+    """Process-lifetime totals surfaced in /api/graph stats (G-P2-1)."""
+    before = store.counters()
+
+    now = time.time()
+    base = dict(from_node_id=5, gateway_node_id=5, mesh_packet_id=42)
+    assert (
+        store.insert_packet(
+            settings.db_file, make_packet(**base, timestamp=now - 30)
+        )
+        is True
+    )
+    assert (
+        store.insert_packet(
+            settings.db_file, make_packet(**base, timestamp=now)
+        )
+        is False
+    )  # +1 packets_deduplicated
+
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=5, gateway_node_id=5, mesh_packet_id=43,
+            timestamp=now - 48 * 3600,
+        ),
+    )
+    assert store.prune(settings.db_file, 24) == 1  # +1 packets_pruned_total
+
+    after = store.counters()
+    assert after["packets_deduplicated"] == before["packets_deduplicated"] + 1
+    assert after["packets_pruned_total"] == before["packets_pruned_total"] + 1
