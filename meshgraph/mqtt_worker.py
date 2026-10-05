@@ -7,10 +7,11 @@ the settings dialog can reconnect to a new broker without a restart.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
@@ -26,6 +27,12 @@ RATE_WINDOW_SECONDS = 300.0
 
 # How often the capture loop re-checks the retention setting (G-P0-1).
 PRUNE_INTERVAL_SECONDS = 3600.0
+
+# Raw messages buffered between the paho callback and the store thread: at
+# the documented 15-20 msg/s that is nearly a minute of headroom.  When the
+# queue is full the OLDEST item is shed — the freshest packets matter most
+# (G-P1-2).
+INBOX_MAXSIZE = 1000
 
 
 def _rc_value(reason_code: Any) -> int:
@@ -49,19 +56,31 @@ def _rc_value(reason_code: Any) -> int:
 class CaptureWorker:
     """Owns the paho client and keeps it in sync with the settings store."""
 
-    def __init__(self, settings_store: SettingsStore) -> None:
+    def __init__(
+        self,
+        settings_store: SettingsStore,
+        client_factory: Callable[..., mqtt.Client] | None = None,
+    ) -> None:
         self._settings_store = settings_store
         self._lock = threading.RLock()
         self._client: mqtt.Client | None = None
         self._settings: Settings = settings_store.get()
         self._running = False
         self._thread: threading.Thread | None = None
+        self._store_thread: threading.Thread | None = None
+        # Test seam: a fake factory records lifecycle calls without touching
+        # the network (G-P1-1).
+        self._client_factory = client_factory or mqtt.Client
+        self._inbox: "queue.Queue[tuple[str, bytes, Settings]]" = queue.Queue(
+            maxsize=INBOX_MAXSIZE
+        )
 
         self._stats: dict[str, Any] = {
             "messages": 0,
             "decoded": 0,
             "deduplicated": 0,
             "dropped": 0,
+            "dropped_queue": 0,
             "decrypt_failed": 0,
             "errors": 0,
             "reconnects": 0,
@@ -89,7 +108,11 @@ class CaptureWorker:
         self._thread = threading.Thread(
             target=self._run, name="meshgraph-mqtt", daemon=True
         )
+        self._store_thread = threading.Thread(
+            target=self._drain_inbox, name="meshgraph-mqtt-store", daemon=True
+        )
         self._thread.start()
+        self._store_thread.start()
 
     def stop(self) -> None:
         with self._lock:
@@ -101,6 +124,14 @@ class CaptureWorker:
                 client.loop_stop()
             except Exception:  # noqa: BLE001
                 pass
+        # Join both threads: the supervisor must not outlive stop(), and the
+        # store thread finishes draining the inbox first (G-P1-1, G-P1-2).
+        threads = (self._thread, self._store_thread)
+        self._thread = None
+        self._store_thread = None
+        for thread in threads:
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=5.0)
 
     def _run(self) -> None:
         """Rebuild the client whenever settings change, keeping one alive."""
@@ -123,6 +154,27 @@ class CaptureWorker:
                 self._prune_if_due(settings)
 
             time.sleep(0.5)
+
+    def _drain_inbox(self) -> None:
+        """Decode and store queued messages (the ``meshgraph-mqtt-store`` thread).
+
+        Decode, decryption and SQLite writes must not block paho's network
+        loop (G-P1-2): the callback only enqueues.  On shutdown whatever is
+        already queued is processed before the thread exits.
+        """
+        while True:
+            try:
+                topic, payload, settings = self._inbox.get(timeout=0.2)
+            except queue.Empty:
+                with self._lock:
+                    stopping = not self._running
+                if stopping:
+                    return
+                continue
+            try:
+                self._process_message(topic, payload, settings)
+            finally:
+                self._inbox.task_done()
 
     def _prune_if_due(self, settings: Settings) -> None:
         """Honour ``retention_hours`` (0 keeps everything), called hourly from ``_run``.
@@ -172,7 +224,7 @@ class CaptureWorker:
             self._record_error(f"database init failed: {exc}")
             return
 
-        client = mqtt.Client(
+        client = self._client_factory(
             callback_api_version=CallbackAPIVersion.VERSION2,
             client_id=settings.mqtt_client_id or None,
             protocol=mqtt.MQTTv311,
@@ -215,10 +267,18 @@ class CaptureWorker:
             sanitize_for_log(settings.subscribe_topic),
         )
         try:
-            client.connect_async(
-                settings.mqtt_broker_address, int(settings.mqtt_port), keepalive=60
-            )
-            client.loop_start()
+            # Held across connect/loop_start: a stop() landing between the
+            # "am I running" check and loop_start() used to leave an orphaned
+            # client reconnecting forever (G-P1-1).
+            with self._lock:
+                if not self._running:
+                    return
+                client.connect_async(
+                    settings.mqtt_broker_address,
+                    int(settings.mqtt_port),
+                    keepalive=60,
+                )
+                client.loop_start()
         except Exception as exc:  # noqa: BLE001
             self._record_error(f"connect failed: {sanitize_for_log(exc)}")
 
@@ -250,7 +310,8 @@ class CaptureWorker:
 
     def _on_connect_fail(self, client: mqtt.Client, userdata: Any) -> None:
         """paho calls this on every failed TCP/TLS attempt during retry."""
-        settings = self._settings
+        with self._lock:
+            settings = self._settings
         self._record_error(
             f"cannot reach {sanitize_for_log(settings.mqtt_broker_address)}:"
             f"{settings.mqtt_port} ({'mqtts' if settings.mqtt_tls else 'mqtt'}) "
@@ -271,6 +332,12 @@ class CaptureWorker:
     def _on_message(
         self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage
     ) -> None:
+        """paho network-loop callback: count the arrival and hand it over.
+
+        Only a non-blocking enqueue happens here — decode, decryption and
+        SQLite writes live on the store thread, so a slow disk can no longer
+        stall keepalives (G-P1-2).
+        """
         with self._lock:
             settings = self._settings
             self._stats["messages"] += 1
@@ -278,7 +345,25 @@ class CaptureWorker:
             self._note_message(time.monotonic())
 
         try:
-            packet = decode_message(msg.topic, msg.payload, settings.keys)
+            self._inbox.put_nowait((msg.topic, msg.payload, settings))
+        except queue.Full:
+            with self._lock:
+                self._stats["dropped_queue"] += 1
+            # Shed the oldest item: fresher packets are worth more.
+            try:
+                self._inbox.get_nowait()
+                self._inbox.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._inbox.put_nowait((msg.topic, msg.payload, settings))
+            except queue.Full:
+                pass  # a racing producer won; this packet is dropped
+
+    def _process_message(self, topic: str, payload: bytes, settings: Settings) -> None:
+        """Decode and persist one queued message (store thread)."""
+        try:
+            packet = decode_message(topic, payload, settings.keys)
         except Exception as exc:  # noqa: BLE001
             self._record_error(f"decode failed: {sanitize_for_log(exc)}")
             return
