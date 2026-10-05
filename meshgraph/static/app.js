@@ -1433,8 +1433,6 @@ function init() {
   initSidebar();
   initChat();
 
-  ["applyBtn"].forEach((id) => $(id).addEventListener("click", applyFilters));
-
   document.querySelectorAll('input[name="mode"]').forEach((radio) => {
     radio.addEventListener("change", applyFilters);
   });
@@ -1444,10 +1442,6 @@ function init() {
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && event.target.tagName === "SELECT") {
-      event.preventDefault();
-      applyFilters();
-    }
     if (event.key === "Escape") {
       if (!$("settingsModal").hidden) closeSettings();
       else select(null, null);
