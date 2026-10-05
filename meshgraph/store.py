@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 _lock = threading.RLock()
 _initialized_for: str | None = None
 
+# Sliding window for reception deduplication: a redelivery of the same radio
+# packet (broker QoS retry, reconnect replay) arrives seconds to minutes
+# later.  Outside the window an equal mesh_packet_id is a *new* packet — the
+# id is random 32-bit and wraps around over a node's lifetime.
+DEDUP_WINDOW_SECONDS = 600.0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS packets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_packets_port_time ON packets(portnum_name, timest
 CREATE INDEX IF NOT EXISTS idx_packets_from_time ON packets(from_node_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_packets_gateway_time ON packets(gateway_node_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_packets_direct ON packets(gateway_node_id, hop_start, hop_limit);
+CREATE INDEX IF NOT EXISTS idx_packets_dedup ON packets(from_node_id, mesh_packet_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen);
 """
 
@@ -158,6 +165,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if column not in existing:
             conn.execute(f"ALTER TABLE packets ADD COLUMN {column} {decl}")
 
+    # Legacy duplicates — the same reception delivered twice by the broker —
+    # predate the sliding-window check in insert_packet.  The sweep is
+    # idempotent: a second run finds nothing to delete (rows without a packet
+    # id are intentionally never matched).
+    conn.execute(
+        """
+        DELETE FROM packets
+        WHERE mesh_packet_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM packets AS earlier
+            WHERE earlier.id < packets.id
+              AND earlier.from_node_id = packets.from_node_id
+              AND earlier.mesh_packet_id = packets.mesh_packet_id
+              AND earlier.gateway_id IS packets.gateway_id
+              AND ABS(earlier.timestamp - packets.timestamp) <= ?
+          )
+        """,
+        (DEDUP_WINDOW_SECONDS,),
+    )
+
 
 def ensure_ready(settings: Settings) -> None:
     init(settings.db_file)
@@ -167,11 +194,44 @@ def ensure_ready(settings: Settings) -> None:
 # Writes
 # ---------------------------------------------------------------------------
 
-def insert_packet(db_file: str, packet: DecodedPacket) -> None:
-    """Persist one decoded packet plus any node metadata it carried."""
+def _is_duplicate_reception(conn: sqlite3.Connection, packet: DecodedPacket) -> bool:
+    """True when this (sender, packet id, gateway) was already heard nearby in time."""
+    if packet.mesh_packet_id is None or not packet.from_node_id:
+        return False  # without a packet id there is nothing to match on
+    ts = packet.timestamp
+    row = conn.execute(
+        """
+        SELECT 1 FROM packets
+        WHERE from_node_id = :from_id
+          AND mesh_packet_id = :packet_id
+          AND gateway_id IS :gateway
+          AND timestamp BETWEEN :lo AND :hi
+        LIMIT 1
+        """,
+        {
+            "from_id": packet.from_node_id,
+            "packet_id": packet.mesh_packet_id,
+            "gateway": packet.gateway_id,
+            "lo": ts - DEDUP_WINDOW_SECONDS,
+            "hi": ts + DEDUP_WINDOW_SECONDS,
+        },
+    ).fetchone()
+    return row is not None
+
+
+def insert_packet(db_file: str, packet: DecodedPacket) -> bool:
+    """Persist one decoded packet plus any node metadata it carried.
+
+    Returns False for a duplicate reception: the same mesh packet heard again
+    through the same gateway inside DEDUP_WINDOW_SECONDS (broker redelivery,
+    reconnect replay).  Storing it would inflate node counters and edge
+    strength; a different gateway is a different reception and is kept.
+    """
     with _lock:
         conn = _connect(db_file)
         try:
+            if _is_duplicate_reception(conn, packet):
+                return False
             row = packet.to_row()
             row["processed"] = 1 if packet.processed else 0
             row["via_mqtt"] = None if packet.via_mqtt is None else int(packet.via_mqtt)
@@ -220,12 +280,24 @@ def insert_packet(db_file: str, packet: DecodedPacket) -> None:
                 )
 
             conn.commit()
+            return True
         finally:
             conn.close()
 
 
 def prune(db_file: str, retention_hours: int) -> int:
-    """Drop packets older than the retention window.  0 disables pruning."""
+    """Drop packets older than the retention window.  0 disables pruning.
+
+    Stale node rows (last seen before the cutoff) go with their packets, and
+    the survivors' ``packet_count`` is recounted: the counter feeds edge
+    weights, so it must track the stored rows — a node counts once per row as
+    the sender and once as the gateway, mirroring ``_UPSERT_NODE_BASE``.
+
+    ``raw_payload`` travels with its packet and is never trimmed separately:
+    the chat renders messages straight from the BLOB, so history size is
+    bounded by the window (``retention_hours = 0`` keeps everything — an
+    explicit choice to let the database grow).
+    """
     if retention_hours <= 0:
         return 0
     cutoff = time.time() - retention_hours * 3600
@@ -233,8 +305,19 @@ def prune(db_file: str, retention_hours: int) -> int:
         conn = _connect(db_file)
         try:
             cur = conn.execute("DELETE FROM packets WHERE timestamp < ?", (cutoff,))
-            conn.commit()
             deleted = cur.rowcount or 0
+            conn.execute("DELETE FROM nodes WHERE last_seen < ?", (cutoff,))
+            if deleted:
+                conn.execute(
+                    """
+                    UPDATE nodes SET packet_count =
+                        (SELECT COUNT(*) FROM packets AS p
+                          WHERE p.from_node_id = nodes.node_id)
+                      + (SELECT COUNT(*) FROM packets AS p
+                          WHERE p.gateway_node_id = nodes.node_id)
+                    """
+                )
+            conn.commit()
             if deleted:
                 logger.info("Pruned %s packets older than %sh", deleted, retention_hours)
             return deleted

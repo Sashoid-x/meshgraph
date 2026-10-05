@@ -1,10 +1,12 @@
-"""Schema migrations and the chat columns of the packets table."""
+"""Schema migrations, the chat columns, retention and reception dedup."""
 
 from __future__ import annotations
 
 import sqlite3
+import time
 
 from meshgraph import store
+from meshgraph.store import DEDUP_WINDOW_SECONDS
 
 from .conftest import make_packet
 
@@ -115,3 +117,193 @@ def test_unset_chat_columns_stay_null(db_file):
     )
 
     assert list(rows[0].values()) == [None, None]
+
+
+# ---------------------------------------------------------------------------
+# Retention (store.prune, G-P0-1)
+# ---------------------------------------------------------------------------
+
+
+def _count(db_file: str, table: str = "packets") -> int:
+    return store.query(db_file, f"SELECT COUNT(*) AS c FROM {table}")[0]["c"]
+
+
+def test_prune_keeps_everything_when_retention_is_off(settings):
+    now = time.time()
+    for node in (5, 6):
+        store.insert_packet(
+            settings.db_file,
+            make_packet(
+                timestamp=now - 48 * 3600,
+                from_node_id=node,
+                gateway_node_id=node,
+                mesh_packet_id=node,
+            ),
+        )
+
+    deleted = store.prune(settings.db_file, 0)
+
+    assert deleted == 0
+    assert _count(settings.db_file) == 2
+    assert _count(settings.db_file, "nodes") == 2
+
+
+def test_prune_drops_old_rows_stale_nodes_and_recounts(settings):
+    now = time.time()
+    # D has not been heard since forever: packet row and node row both go.
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            timestamp=now - 100 * 3600, from_node_id=7, gateway_node_id=7, mesh_packet_id=10
+        ),
+    )
+    # A has an old row and a fresh one: the old row goes, the node stays with
+    # a packet_count recounted from the surviving rows.
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            timestamp=now - 100 * 3600, from_node_id=5, gateway_node_id=5, mesh_packet_id=11
+        ),
+    )
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            timestamp=now - 3600, from_node_id=5, gateway_node_id=5, mesh_packet_id=12
+        ),
+    )
+
+    deleted = store.prune(settings.db_file, 24)
+
+    assert deleted == 2
+    assert [
+        row["from_node_id"]
+        for row in store.query(settings.db_file, "SELECT from_node_id FROM packets")
+    ] == [5]
+
+    counts = {
+        row["node_id"]: row["packet_count"]
+        for row in store.query(settings.db_file, "SELECT node_id, packet_count FROM nodes")
+    }
+    assert 7 not in counts          # unseen since before the cutoff — removed
+    assert counts[5] == 2           # one surviving row: sender + gateway mention
+
+
+def test_prune_is_idempotent(settings):
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            timestamp=time.time() - 48 * 3600,
+            from_node_id=5,
+            gateway_node_id=5,
+            mesh_packet_id=1,
+        ),
+    )
+
+    assert store.prune(settings.db_file, 24) == 1
+    assert store.prune(settings.db_file, 24) == 0
+    assert _count(settings.db_file) == 0
+
+
+# ---------------------------------------------------------------------------
+# Reception deduplication (G-P0-2)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_reception_is_skipped(settings):
+    first = make_packet(
+        from_node_id=5, gateway_node_id=5, mesh_packet_id=42, timestamp=1_000_000.0
+    )
+    redelivery = make_packet(
+        from_node_id=5, gateway_node_id=5, mesh_packet_id=42, timestamp=1_000_000.0 + 30
+    )
+
+    assert store.insert_packet(settings.db_file, first) is True
+    assert store.insert_packet(settings.db_file, redelivery) is False
+
+    assert _count(settings.db_file) == 1
+    # The skipped duplicate must not inflate the node counter either.
+    counts = store.query(
+        settings.db_file, "SELECT packet_count AS c FROM nodes WHERE node_id = 5"
+    )
+    assert counts[0]["c"] == 2  # sender + gateway of the single stored row
+
+
+def test_same_packet_via_another_gateway_is_kept(settings):
+    assert (
+        store.insert_packet(
+            settings.db_file,
+            make_packet(
+                from_node_id=5, gateway_node_id=5, mesh_packet_id=42, timestamp=1_000_000.0
+            ),
+        )
+        is True
+    )
+    assert (
+        store.insert_packet(
+            settings.db_file,
+            make_packet(
+                from_node_id=5, gateway_node_id=9, mesh_packet_id=42, timestamp=1_000_000.0
+            ),
+        )
+        is True
+    )  # a different gateway heard it — a genuinely different reception
+
+    assert _count(settings.db_file) == 2
+
+
+def test_packet_id_reuse_outside_the_window_is_kept(settings):
+    base = dict(from_node_id=5, gateway_node_id=5, mesh_packet_id=42)
+    assert (
+        store.insert_packet(
+            settings.db_file, make_packet(timestamp=1_000_000.0, **base)
+        )
+        is True
+    )
+    assert (
+        store.insert_packet(
+            settings.db_file,
+            make_packet(timestamp=1_000_000.0 + DEDUP_WINDOW_SECONDS + 1, **base),
+        )
+        is True
+    )  # mesh_packet_id is random 32-bit: outside the window it is a new packet
+
+    assert _count(settings.db_file) == 2
+
+
+def test_packets_without_ids_never_deduplicate(settings):
+    for _ in range(2):
+        assert (
+            store.insert_packet(
+                settings.db_file,
+                make_packet(
+                    from_node_id=5, gateway_node_id=5, mesh_packet_id=None,
+                    timestamp=1_000_000.0,
+                ),
+            )
+            is True
+        )
+
+    assert _count(settings.db_file) == 2
+
+
+def test_migration_drops_historical_duplicates_and_is_idempotent(db_file):
+    store.init(db_file)
+    conn = sqlite3.connect(db_file)
+    try:
+        # Two legacy rows of the same reception (30 s apart) plus a legitimate
+        # id reuse an hour later — only the second duplicate must survive.
+        for ts in (1_000_000.0, 1_000_030.0, 1_000_000.0 + 3600):
+            conn.execute(
+                "INSERT INTO packets (timestamp, from_node_id, gateway_id,"
+                " mesh_packet_id) VALUES (?, 5, '!00000005', 42)",
+                (ts,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store.init(db_file)  # migration sweep
+    store.init(db_file)  # again — must be a no-op
+
+    rows = store.query(db_file, "SELECT timestamp FROM packets ORDER BY timestamp")
+    assert [row["timestamp"] for row in rows] == [1_000_000.0, 1_000_000.0 + 3600]

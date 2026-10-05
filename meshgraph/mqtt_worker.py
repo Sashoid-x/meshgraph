@@ -26,6 +26,9 @@ RECONNECT_DELAY_SECONDS = 5.0
 # How far back the sliding message rate looks (the /api/status "rate_5m").
 RATE_WINDOW_SECONDS = 300.0
 
+# How often the capture loop re-checks the retention setting (G-P0-1).
+PRUNE_INTERVAL_SECONDS = 3600.0
+
 
 def _rc_value(reason_code: Any) -> int:
     """Normalise paho reason codes (int, ReasonCode, or None) to an int."""
@@ -59,6 +62,7 @@ class CaptureWorker:
         self._stats: dict[str, Any] = {
             "messages": 0,
             "decoded": 0,
+            "deduplicated": 0,
             "dropped": 0,
             "decrypt_failed": 0,
             "errors": 0,
@@ -103,6 +107,7 @@ class CaptureWorker:
     def _run(self) -> None:
         """Rebuild the client whenever settings change, keeping one alive."""
         seen_signature: str | None = None
+        next_prune = 0.0  # honour the retention setting from the very first tick
         while True:
             with self._lock:
                 if not self._running:
@@ -114,7 +119,25 @@ class CaptureWorker:
                 seen_signature = signature
                 self._replace_client(settings)
 
+            now = time.time()
+            if now >= next_prune:
+                next_prune = now + PRUNE_INTERVAL_SECONDS
+                self._prune_if_due(settings)
+
             time.sleep(0.5)
+
+    def _prune_if_due(self, settings: Settings) -> None:
+        """Honour ``retention_hours`` (0 keeps everything), called hourly from ``_run``.
+
+        Housekeeping must never take the capture down: failures land in
+        ``last_error`` like any other worker error.
+        """
+        if not settings.retention_hours:
+            return
+        try:
+            store.prune(settings.db_file, settings.retention_hours)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(f"prune failed: {sanitize_for_log(exc)}")
 
     @staticmethod
     def _signature(settings: Settings) -> str:
@@ -272,9 +295,11 @@ class CaptureWorker:
                 self._stats["decrypt_failed"] += 1
 
         try:
-            store.insert_packet(settings.db_file, packet)
+            stored = store.insert_packet(settings.db_file, packet)
             with self._lock:
                 self._stats["decoded"] += 1
+                if not stored:
+                    self._stats["deduplicated"] += 1
         except Exception as exc:  # noqa: BLE001
             self._record_error(f"store failed: {sanitize_for_log(exc)}")
 

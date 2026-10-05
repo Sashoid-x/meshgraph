@@ -379,6 +379,30 @@ def test_rssi_mode_aggregates_repeated_receptions(settings):
     assert gateway_node["packet_count"] == 3
 
 
+def test_duplicate_reception_does_not_inflate_strength(settings):
+    """The same reception redelivered by the broker must not double the weight."""
+    for _ in range(2):  # a redelivery inside the dedup window
+        store.insert_packet(
+            settings.db_file,
+            make_packet(
+                from_node_id=X,
+                gateway_node_id=GATEWAY,
+                hop_limit=3,
+                hop_start=3,
+                snr=7.5,
+                rssi=-80,
+                portnum_name="TELEMETRY_APP",
+                mesh_packet_id=777,
+            ),
+        )
+
+    payload = graph.build_graph(settings, mode="rssi", hours=24, use_cache=False)
+    link = payload["links"][0]
+
+    assert link["packet_count"] == 1
+    assert link["strength"] == graph._strength(7.5, -80, 1)
+
+
 def test_rssi_mode_applies_min_snr(settings):
     store.insert_packet(
         settings.db_file,
