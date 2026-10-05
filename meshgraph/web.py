@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from pathlib import Path
 
@@ -158,6 +159,24 @@ def create_app(
         if request.path.startswith("/api/"):
             return jsonify({"error": "not found"}), 404
         return "Not found", 404
+
+    @app.errorhandler(500)
+    def internal_error(error):
+        # The frontend expects JSON from /api/*; an HTML crash page would
+        # arrive as a string and break the UI silently.  Log the cause with a
+        # traceback, calling out database failures separately.
+        original = getattr(error, "original_exception", None) or error
+        kind = "Database error" if isinstance(original, sqlite3.Error) else "Internal error"
+        logger.error(
+            "%s on %s: %s",
+            kind,
+            request.path,
+            original,
+            exc_info=(type(original), original, original.__traceback__),
+        )
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "internal error"}), 500
+        return "Internal server error", 500
 
     return app
 

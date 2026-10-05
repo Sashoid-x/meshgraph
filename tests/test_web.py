@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -347,3 +348,22 @@ def test_unknown_api_route_returns_json_404(client):
     response = client.get("/api/does-not-exist")
     assert response.status_code == 404
     assert response.get_json() == {"error": "not found"}
+
+
+def test_graph_failure_returns_json_500(settings_store, tmp_path, monkeypatch):
+    """A crashing build_graph must not answer HTML to the frontend (G-P1-5)."""
+    from meshgraph import graph
+
+    settings_store.update(db_file=str(tmp_path / "web.db"))
+    app = web.create_app(settings_store, start_worker=False)
+    # Tests run with propagate=True (app.testing); the handler must fire here.
+    app.config["PROPAGATE_EXCEPTIONS"] = False
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(graph, "build_graph", boom)
+    response = app.test_client().get("/api/graph")
+
+    assert response.status_code == 500
+    assert response.get_json() == {"error": "internal error"}

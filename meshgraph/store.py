@@ -338,21 +338,30 @@ def query(db_file: str, sql: str, params: Sequence[Any] | tuple = ()) -> list[di
         conn.close()
 
 
+# Ids per IN (...) batch: well below SQLite's variable limit (32766 by
+# default today, but some builds still ship the classic 999).
+NODE_LOOKUP_CHUNK = 500
+
+
 def node_lookup(db_file: str, node_ids: list[int]) -> dict[int, dict[str, Any]]:
-    """Bulk name / coordinate lookup for a set of node ids."""
+    """Bulk name / coordinate lookup for a set of node ids (chunked by IN-size)."""
     if not node_ids:
         return {}
-    placeholders = ",".join("?" for _ in node_ids)
-    rows = query(
-        db_file,
-        f"""
-        SELECT node_id, hex_id, long_name, short_name, hw_model, role,
-               latitude, longitude, altitude, position_ts, last_seen
-        FROM nodes WHERE node_id IN ({placeholders})
-        """,
-        node_ids,
-    )
-    return {r["node_id"]: r for r in rows}
+    found: dict[int, dict[str, Any]] = {}
+    for start in range(0, len(node_ids), NODE_LOOKUP_CHUNK):
+        chunk = node_ids[start : start + NODE_LOOKUP_CHUNK]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = query(
+            db_file,
+            f"""
+            SELECT node_id, hex_id, long_name, short_name, hw_model, role,
+                   latitude, longitude, altitude, position_ts, last_seen
+            FROM nodes WHERE node_id IN ({placeholders})
+            """,
+            chunk,
+        )
+        found.update({r["node_id"]: r for r in rows})
+    return found
 
 
 def distinct_channels(db_file: str, since: float) -> list[str]:

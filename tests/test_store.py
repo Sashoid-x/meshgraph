@@ -307,3 +307,35 @@ def test_migration_drops_historical_duplicates_and_is_idempotent(db_file):
 
     rows = store.query(db_file, "SELECT timestamp FROM packets ORDER BY timestamp")
     assert [row["timestamp"] for row in rows] == [1_000_000.0, 1_000_000.0 + 3600]
+
+
+# ---------------------------------------------------------------------------
+# node_lookup chunking (G-P1-6)
+# ---------------------------------------------------------------------------
+
+
+def test_node_lookup_chunks_large_id_lists(settings, monkeypatch):
+    known = list(range(0x1000, 0x100A))  # ten named nodes out of five thousand ids
+    now = time.time()
+    conn = sqlite3.connect(settings.db_file)
+    try:
+        for node_id in known:
+            conn.execute(
+                "INSERT INTO nodes (node_id, long_name, first_seen, last_seen,"
+                " packet_count) VALUES (?, ?, ?, ?, 0)",
+                (node_id, f"node-{node_id}", now, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ids = list(range(1, 5001))
+    found = store.node_lookup(settings.db_file, ids)
+
+    assert sorted(found) == known
+    assert found[known[0]]["long_name"] == "node-4096"
+
+    # The answer must not depend on how the ids were split into batches.
+    monkeypatch.setattr(store, "NODE_LOOKUP_CHUNK", 7)
+    assert store.node_lookup(settings.db_file, ids) == found
+    assert store.node_lookup(settings.db_file, []) == {}

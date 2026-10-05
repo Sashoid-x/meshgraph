@@ -21,8 +21,6 @@ from .decoder import decode_message, sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
-RECONNECT_DELAY_SECONDS = 5.0
-
 # How far back the sliding message rate looks (the /api/status "rate_5m").
 RATE_WINDOW_SECONDS = 300.0
 
