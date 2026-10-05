@@ -7,6 +7,7 @@ the capture worker and the web UI always read the same source of truth.
 
 from __future__ import annotations
 
+import logging
 import os
 import base64
 import threading
@@ -18,6 +19,8 @@ from typing import Any, Callable
 import yaml
 
 from .crypto import MAX_PSK_BYTES, MESHTASTIC_DEFAULT_PSK
+
+logger = logging.getLogger(__name__)
 
 # Default Meshtastic LongFast channel key (base64).  Traceroute packets on the
 # default channel are encrypted with it, so a graph built without any key would
@@ -190,9 +193,17 @@ class SettingsStore:
                     loaded = yaml.safe_load(self._path.read_text(encoding="utf-8"))
                     if isinstance(loaded, dict):
                         data = loaded
-                except yaml.YAMLError:
+                    elif loaded is not None:
+                        # The user must learn their settings were ignored.
+                        logger.warning(
+                            "Ignoring settings file %s: expected a mapping", self._path
+                        )
+                except yaml.YAMLError as exc:
                     # A corrupt file must not stop the service; fall back to
                     # defaults and let the user fix it from the settings dialog.
+                    logger.warning(
+                        "Ignoring corrupt settings file %s: %s", self._path, exc
+                    )
                     data = {}
 
             known = {f.name for f in fields(Settings)}

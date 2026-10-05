@@ -12,6 +12,32 @@
 "use strict";
 
 /**
+ * Single source of truth for the numbers that shape the render: force
+ * strengths, island packing and viewport fitting.  app.js renders with these,
+ * tests/test_layout_js.py drives the very same constants — a parameter drift
+ * between the real render and the test is impossible (G-P2-2).
+ */
+globalThis.MESHGRAPH_FORCE_PARAMS = {
+  // forces
+  linkDistanceMin: 140,
+  linkDistanceBase: 180,
+  linkDistancePerStrength: 20,
+  chargeStrength: -110,
+  collisionPad: 50,
+  // island packing / simulation
+  islandGap: 20,
+  gatherTicks: 120,
+  seedJitter: 60,
+  // viewport fitting
+  cellsFitMargin: 0.92,
+  contentFitMargin: 0.9,
+  contentFitMaxScale: 2.5,
+  focusScale: 1.6,
+  zoomScaleMin: 0.05,
+  zoomScaleMax: 10,
+};
+
+/**
  * Connected components of the drawn graph (union-find over node ids).
  * Follows direct links and multi-hop "indirect" connections alike, so an
  * island is genuinely a part with no path to the others.  Link endpoints may
@@ -357,4 +383,118 @@ function meshgraphAvoidLinks(links, clearance, strength) {
   };
 
   return force;
+}
+
+/**
+ * Link distance for the force simulation: short links for strong
+ * connections, floored so the graph never collapses into a knot.
+ * Shared by app.js (real render) and the d3 scenario in the tests.
+ */
+function meshgraphLinkDistance(link) {
+  const p = globalThis.MESHGRAPH_FORCE_PARAMS;
+  return Math.max(
+    p.linkDistanceMin,
+    p.linkDistanceBase - link.strength * p.linkDistancePerStrength
+  );
+}
+
+/** Collision radius of a node: its size plus the shared padding. */
+function meshgraphCollisionRadius(node) {
+  const size = typeof node.size === "number" ? node.size : 10;
+  return size + globalThis.MESHGRAPH_FORCE_PARAMS.collisionPad;
+}
+
+/**
+ * Position seeding for a render: nodes known from the previous render keep
+ * their coordinates (and velocity), fresh ones appear on a circle around the
+ * canvas centre with a small jitter.  Mutates the nodes in place and returns
+ * how many were inherited — the real code path, executable in tests.
+ */
+function meshgraphSeedPositions(nodes, prevNodes, viewWidth, viewHeight) {
+  const p = globalThis.MESHGRAPH_FORCE_PARAMS;
+  const list = nodes || [];
+  const radius = Math.min(viewWidth, viewHeight) * 0.3;
+  let inherited = 0;
+  list.forEach((node, i) => {
+    const prev =
+      prevNodes && typeof prevNodes.get === "function"
+        ? prevNodes.get(node.id)
+        : null;
+    if (prev && typeof prev.x === "number" && !Number.isNaN(prev.x)) {
+      node.x = prev.x;
+      node.y = prev.y;
+      if (typeof prev.vx === "number") {
+        node.vx = prev.vx;
+        node.vy = prev.vy;
+      }
+      inherited += 1;
+      return;
+    }
+    const angle = (2 * Math.PI * i) / Math.max(list.length, 1);
+    node.x =
+      viewWidth / 2 + Math.cos(angle) * radius + (Math.random() - 0.5) * p.seedJitter;
+    node.y =
+      viewHeight / 2 + Math.sin(angle) * radius + (Math.random() - 0.5) * p.seedJitter;
+  });
+  return inherited;
+}
+
+/**
+ * Pure geometry behind fitToCells: planned island cells ({tx, ty, r}) →
+ * {k, cx, cy} where (cx, cy) is the plan's centre and k the scale that fits
+ * it into the viewport with the shared margin — never above 1, so a small
+ * plan is not blown up.  Returns null when there is nothing to fit.
+ */
+function meshgraphFitCellsTransform(cells, viewWidth, viewHeight) {
+  if (!cells || !cells.length) return null;
+  const p = globalThis.MESHGRAPH_FORCE_PARAMS;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const cell of cells) {
+    minX = Math.min(minX, cell.tx - cell.r);
+    maxX = Math.max(maxX, cell.tx + cell.r);
+    minY = Math.min(minY, cell.ty - cell.r);
+    maxY = Math.max(maxY, cell.ty + cell.r);
+  }
+  const bw = maxX - minX;
+  const bh = maxY - minY;
+  if (!bw || !bh) return null;
+  const k = Math.min(
+    1,
+    (p.cellsFitMargin * viewWidth) / bw,
+    (p.cellsFitMargin * viewHeight) / bh
+  );
+  return { k, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+}
+
+/**
+ * Pure geometry behind fitToContent: a content bounding box → {scale, tx,
+ * ty} for d3.zoomIdentity.translate(tx, ty).scale(scale), so the whole box
+ * lands centred in the viewport.  Scale is capped by contentFitMaxScale;
+ * null when the box is empty.
+ */
+function meshgraphFitBoundsTransform(bounds, viewWidth, viewHeight) {
+  if (!bounds || !bounds.width || !bounds.height) return null;
+  const p = globalThis.MESHGRAPH_FORCE_PARAMS;
+  const scale = Math.min(
+    p.contentFitMaxScale,
+    p.contentFitMargin / Math.max(bounds.width / viewWidth, bounds.height / viewHeight)
+  );
+  return {
+    scale,
+    tx: viewWidth / 2 - scale * (bounds.x + bounds.width / 2),
+    ty: viewHeight / 2 - scale * (bounds.y + bounds.height / 2),
+  };
+}
+
+/**
+ * Pure geometry behind focusOnNode: {k, tx, ty} for
+ * d3.zoomIdentity.translate(tx, ty).scale(k) — the point (x, y) maps to the
+ * centre of the viewport at the shared focus scale.
+ */
+function meshgraphFocusTransform(x, y, viewWidth, viewHeight) {
+  const k = globalThis.MESHGRAPH_FORCE_PARAMS.focusScale;
+  return { k, tx: viewWidth / 2 - k * x, ty: viewHeight / 2 - k * y };
 }

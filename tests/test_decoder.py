@@ -361,3 +361,25 @@ def test_hex_id_to_numeric(hex_id, expected):
 
 def test_hex_id_roundtrip():
     assert numeric_to_hex_id(0xABCDEF12) == "!abcdef12"
+
+
+def test_sanitize_for_log_strips_control_characters():
+    from meshgraph.decoder import sanitize_for_log
+
+    # CWE-117: переводы строк и управляющие символы не должны попадать в лог.
+    assert sanitize_for_log("line1\r\nline2") == "line1�\nline2".replace(
+        "\n", "�"
+    )
+
+
+def test_sanitize_for_log_truncates_overlong_values():
+    from meshgraph.decoder import sanitize_for_log
+
+    assert sanitize_for_log("x" * 500, limit=10) == "x" * 10 + "…"
+
+
+def test_sanitize_for_log_keeps_plain_text():
+    from meshgraph.decoder import sanitize_for_log
+
+    text = "mqtt.onemesh.ru:8883 msh/RU/SAR/#"
+    assert sanitize_for_log(text) == text

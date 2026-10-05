@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 
 import pytest
 
@@ -156,11 +157,23 @@ def test_change_notification_fires(settings_store):
     assert seen == ["changed.example"]
 
 
-def test_corrupt_yaml_falls_back_to_defaults(tmp_path):
+def test_corrupt_yaml_falls_back_to_defaults(tmp_path, caplog):
     path = tmp_path / "config.yaml"
     path.write_text("{{ not yaml: [", encoding="utf-8")
     store = SettingsStore(path=path)
-    assert store.get().mqtt_port == 1883
+    with caplog.at_level(logging.WARNING, logger="meshgraph.config"):
+        assert store.get().mqtt_port == 1883
+    # Пользователь должен узнать, что его настройки проигнорированы (G-P2-4).
+    assert str(path) in caplog.text
+
+
+def test_non_mapping_yaml_is_also_logged(tmp_path, caplog):
+    path = tmp_path / "config.yaml"
+    path.write_text("- just\n- a list\n", encoding="utf-8")
+    store = SettingsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="meshgraph.config"):
+        assert store.get().mqtt_port == 1883
+    assert str(path) in caplog.text
 
 
 def test_topic_and_keys_helpers():

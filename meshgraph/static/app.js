@@ -42,7 +42,7 @@ const AUTO_REFRESH_MS = 60000;
 const STATUS_POLL_MS = 4000;
 // Плановый зазор между острами: коллизия узлов и так держит ~100 px белого
 // между частями, ещё 20 px сверху — отделены видно, но и всё на экране.
-const ISLAND_GAP = 20;
+const ISLAND_GAP = MESHGRAPH_FORCE_PARAMS.islandGap;
 
 const snrColor = () => d3.scaleSequential(d3.interpolateRdYlGn).domain([-30, 10]);
 
@@ -200,21 +200,6 @@ function renderGraph(data, prevNodes = null) {
   const structureSame = meshgraphSameStructure(state.islandKey, islandKey);
   state.islandKey = islandKey;
 
-  // Наследование координат узла из прошлого рендера — иначе посев как раньше.
-  const inherit = (node) => {
-    const prev = prevNodes && prevNodes.get(node.id);
-    if (!prev || typeof prev.x !== "number" || Number.isNaN(prev.x)) {
-      return false;
-    }
-    node.x = prev.x;
-    node.y = prev.y;
-    if (typeof prev.vx === "number") {
-      node.vx = prev.vx;
-      node.vy = prev.vy;
-    }
-    return true;
-  };
-
   if (!data.nodes || data.nodes.length === 0) {
     state.islandKey = new Map();
     state.islandTargets = null;
@@ -247,7 +232,10 @@ function renderGraph(data, prevNodes = null) {
 
   const zoom = d3
     .zoom()
-    .scaleExtent([0.05, 10])
+    .scaleExtent([
+      MESHGRAPH_FORCE_PARAMS.zoomScaleMin,
+      MESHGRAPH_FORCE_PARAMS.zoomScaleMax,
+    ])
     .on("zoom", (event) => {
       g.attr("transform", event.transform);
       state.viewTransform = event.transform;
@@ -267,14 +255,9 @@ function renderGraph(data, prevNodes = null) {
 
   // Посев: уже показанные узлы остаются на своих местах, новые появляются по
   // кругу. Координаты MapReport на раскладку не влияют — одна ошибочная
-  // координата больше не может испортить вид.
-  data.nodes.forEach((node, i) => {
-    if (inherit(node)) return;
-    const angle = (2 * Math.PI * i) / Math.max(data.nodes.length, 1);
-    const radius = Math.min(width, height) * 0.3;
-    node.x = width / 2 + Math.cos(angle) * radius + (Math.random() - 0.5) * 60;
-    node.y = height / 2 + Math.sin(angle) * radius + (Math.random() - 0.5) * 60;
-  });
+  // координата больше не может испортить вид. Логика целиком в layout.js,
+  // чтобы тесты гоняли тот же код (G-P2-2).
+  meshgraphSeedPositions(data.nodes, prevNodes, width, height);
 
   // -- simulation ---------------------------------------------------------
   const nodeById = new Map(data.nodes.map((n) => [n.id, n]));
@@ -291,10 +274,14 @@ function renderGraph(data, prevNodes = null) {
         // Короткие связи (140–160 px) и слабое отталкивание — подобрано на
         // реальных данных: части компактнее почти вдвое (масштаб подгонки
         // ~0.5 на 1200×650), а минимум ~100 px белого держит коллизия.
-        .distance((d) => Math.max(140, 180 - d.strength * 20))
+        // Числа — в MESHGRAPH_FORCE_PARAMS (layout.js), их же читает тест.
+        .distance(meshgraphLinkDistance)
     )
-    .force("charge", d3.forceManyBody().strength(-110))
-    .force("collision", d3.forceCollide().radius((d) => d.size + 50))
+    .force(
+      "charge",
+      d3.forceManyBody().strength(MESHGRAPH_FORCE_PARAMS.chargeStrength)
+    )
+    .force("collision", d3.forceCollide().radius(meshgraphCollisionRadius))
     // Узел не сидит на чужой линии связи: отталкивание от чужих сегментов
     // (свои две линии не считаются) даёт видимый зазор до края узла.
     .force(
@@ -314,8 +301,14 @@ function renderGraph(data, prevNodes = null) {
       // Части сначала «собираются» на месте, чтобы замер был честным; затем
       // каждая уезжает в свою ячейку упаковки — как единое целое.
       simulation.stop();
-      for (let i = 0; i < 120; i += 1) simulation.tick();
-      const radii = meshgraphMeasureIslands(islands, nodeById, 50);
+      for (let i = 0; i < MESHGRAPH_FORCE_PARAMS.gatherTicks; i += 1) {
+        simulation.tick();
+      }
+      const radii = meshgraphMeasureIslands(
+        islands,
+        nodeById,
+        MESHGRAPH_FORCE_PARAMS.collisionPad
+      );
       const cells = meshgraphPlanIslandsFitted(radii, width, height, ISLAND_GAP);
       targets = new Map();
       cells.forEach((cell) => {
@@ -694,66 +687,49 @@ function zoomBy(factor) {
 // Показать план упаковки островов целиком (по известным ячейкам, ещё до
 // движения частей). Масштаб не больше 1: если всё помещается — вид не трогаем.
 function fitToCells(cells) {
-  if (!state.svg || !state.zoom || !cells || !cells.length) return;
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const cell of cells) {
-    minX = Math.min(minX, cell.tx - cell.r);
-    maxX = Math.max(maxX, cell.tx + cell.r);
-    minY = Math.min(minY, cell.ty - cell.r);
-    maxY = Math.max(maxY, cell.ty + cell.r);
-  }
-  const bw = maxX - minX;
-  const bh = maxY - minY;
-  if (!bw || !bh) return;
-  const k = Math.min(
-    1,
-    (0.92 * state.width) / bw,
-    (0.92 * state.height) / bh
-  );
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
+  if (!state.svg || !state.zoom) return;
+  const fit = meshgraphFitCellsTransform(cells, state.width, state.height);
+  if (!fit) return;
   state.svg.call(
     state.zoom.transform,
     d3.zoomIdentity
       .translate(state.width / 2, state.height / 2)
-      .scale(k)
-      .translate(-cx, -cy)
+      .scale(fit.k)
+      .translate(-fit.cx, -fit.cy)
   );
 }
 
 function fitToContent() {
   if (!state.svg || !state.zoom || !state.g) return;
-  const bounds = state.g.node().getBBox();
-  if (!bounds.width || !bounds.height) return;
-  const width = state.width;
-  const height = state.height;
-  const scale = Math.min(
-    2.5,
-    0.9 / Math.max(bounds.width / width, bounds.height / height)
+  const fit = meshgraphFitBoundsTransform(
+    state.g.node().getBBox(),
+    state.width,
+    state.height
   );
-  const tx = width / 2 - scale * (bounds.x + bounds.width / 2);
-  const ty = height / 2 - scale * (bounds.y + bounds.height / 2);
+  if (!fit) return;
   state.svg
     .transition()
     .duration(350)
-    .call(state.zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+    .call(
+      state.zoom.transform,
+      d3.zoomIdentity.translate(fit.tx, fit.ty).scale(fit.scale)
+    );
 }
 
 function focusOnNode(target) {
   if (!state.svg || !state.zoom) return;
-  const k = 1.6;
+  const fit = meshgraphFocusTransform(
+    target.x,
+    target.y,
+    state.width,
+    state.height
+  );
   state.svg
     .transition()
     .duration(450)
     .call(
       state.zoom.transform,
-      d3.zoomIdentity
-        .translate(state.width / 2, state.height / 2)
-        .scale(k)
-        .translate(-target.x, -target.y)
+      d3.zoomIdentity.translate(fit.tx, fit.ty).scale(fit.k)
     );
 }
 

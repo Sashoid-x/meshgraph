@@ -297,18 +297,25 @@ globalThis.runScenario = function() {
 
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const islands = meshgraphFindComponents(nodes, links);
+  // Те же константы, что и в прод-рендере (G-P2-2): расхождение параметров
+  // между сценарием и app.js больше невозможно.
   const sim = d3
     .forceSimulation(nodes)
     .force("link", d3.forceLink(links).id((d) => d.id)
-      .distance((d) => Math.max(140, 180 - d.strength * 20)))
-    .force("charge", d3.forceManyBody().strength(-110))
-    .force("collision", d3.forceCollide().radius((d) => d.size + 50))
+      .distance(meshgraphLinkDistance))
+    .force("charge",
+      d3.forceManyBody().strength(MESHGRAPH_FORCE_PARAMS.chargeStrength))
+    .force("collision", d3.forceCollide().radius(meshgraphCollisionRadius))
     .force("avoidLinks", meshgraphAvoidLinks(links));
   sim.stop();
-  for (let i = 0; i < 120; i++) sim.tick();
+  for (let i = 0; i < MESHGRAPH_FORCE_PARAMS.gatherTicks; i++) sim.tick();
 
-  const radii = meshgraphMeasureIslands(islands, byId, 50);
-  const cells = meshgraphPlanIslandsFitted(radii, 800, 600, 20);
+  const radii = meshgraphMeasureIslands(
+    islands, byId, MESHGRAPH_FORCE_PARAMS.collisionPad
+  );
+  const cells = meshgraphPlanIslandsFitted(
+    radii, 800, 600, MESHGRAPH_FORCE_PARAMS.islandGap
+  );
   const targets = new Map();
   cells.forEach((c) => islands[c.index].forEach((id) => targets.set(id, c)));
   sim.force("islands", meshgraphIslandForce(targets));
@@ -393,3 +400,141 @@ def test_app_js_still_compiles():
     """Compile (not run) app.js: syntax errors fail the suite without a browser."""
     ctx = quickjs.Context()
     ctx.eval("(function(){\n" + APP_JS.read_text(encoding="utf-8") + "\n})")
+
+
+# ---------------------------------------------------------------------------
+# Shared force parameters and view fitting (G-P2-2)
+# ---------------------------------------------------------------------------
+
+
+def test_force_params_are_shared_by_render_and_scenario(js):
+    """Один источник правды: прод-рендер и сценарий читают одни константы."""
+    keys = run(js, "Object.keys(MESHGRAPH_FORCE_PARAMS).sort()")
+    for expected in (
+        "chargeStrength",
+        "collisionPad",
+        "focusScale",
+        "gatherTicks",
+        "islandGap",
+        "linkDistanceMin",
+    ):
+        assert expected in keys
+
+    app_js = APP_JS.read_text(encoding="utf-8")
+    assert "MESHGRAPH_FORCE_PARAMS" in app_js
+    assert "meshgraphLinkDistance" in app_js
+    assert "meshgraphSeedPositions" in app_js
+    # Магических чисел сил в прод-коде не осталось.
+    assert "forceManyBody().strength(-110)" not in app_js
+    assert "d.size + 50" not in app_js
+    assert "180 - d.strength * 20" not in app_js
+
+    # Сценарий д3 пользуется теми же функциями и константами.
+    assert "meshgraphLinkDistance" in _SCENARIO
+    assert "MESHGRAPH_FORCE_PARAMS.chargeStrength" in _SCENARIO
+    assert run(js, "MESHGRAPH_FORCE_PARAMS.chargeStrength") == -110
+
+
+def test_fit_cells_fills_the_view_without_upscaling(js):
+    cells = "[{tx: 0, ty: 0, r: 100}, {tx: 1800, ty: 900, r: 100}]"
+    fit = run(js, f"meshgraphFitCellsTransform({cells}, 800, 600)")
+
+    # Bounding box 2000×1100, центр (900, 450): scale = 0.92·800/2000.
+    assert fit["k"] == pytest.approx(0.368)
+    assert fit["k"] < 1
+    assert fit["cx"] == pytest.approx(900)
+    assert fit["cy"] == pytest.approx(450)
+
+
+def test_fit_cells_never_zooms_a_small_plan_in(js):
+    fit = run(js, "meshgraphFitCellsTransform([{tx: 100, ty: 100, r: 50}], 800, 600)")
+
+    assert fit["k"] == 1
+    assert fit["cx"] == 100
+    assert fit["cy"] == 100
+
+
+def test_fit_cells_rejects_nothing_to_fit(js):
+    assert run(js, "meshgraphFitCellsTransform([], 800, 600)") is None
+    assert run(js, "meshgraphFitCellsTransform(null, 800, 600)") is None
+    # Одна ячейка нулевого радиуса: ширина и высота вырождены.
+    assert (
+        run(js, "meshgraphFitCellsTransform([{tx: 0, ty: 0, r: 0}], 800, 600)") is None
+    )
+
+
+def test_fit_bounds_centres_the_content_and_caps_scale(js):
+    fit = run(
+        js,
+        "meshgraphFitBoundsTransform("
+        "{x: 0, y: 0, width: 900, height: 450}, 800, 600)",
+    )
+
+    # 0.9 / max(900/800, 450/600) = 0.8; центр контента (450, 225) → центр экрана.
+    assert fit["scale"] == pytest.approx(0.8)
+    assert fit["tx"] == pytest.approx(40)
+    assert fit["ty"] == pytest.approx(120)
+
+    # Крошечный контент не раздувается сильнее лимита (2.5).
+    tiny = run(
+        js,
+        "meshgraphFitBoundsTransform({x: 0, y: 0, width: 80, height: 40}, 800, 600)",
+    )
+    assert tiny["scale"] == pytest.approx(2.5)
+
+
+def test_fit_bounds_rejects_empty_content(js):
+    assert run(js, "meshgraphFitBoundsTransform(null, 800, 600)") is None
+    assert (
+        run(js, "meshgraphFitBoundsTransform({x: 0, y: 0, width: 0, height: 10},"
+                " 800, 600)")
+        is None
+    )
+
+
+def test_focus_transform_puts_the_node_in_the_centre(js):
+    fit = run(js, "meshgraphFocusTransform(300, 200, 800, 600)")
+
+    assert fit["k"] == pytest.approx(1.6)
+    assert fit["tx"] == pytest.approx(-80)
+    assert fit["ty"] == pytest.approx(-20)
+    # Точка действительно попадает в центр вида.
+    assert fit["k"] * 300 + fit["tx"] == pytest.approx(400)
+    assert fit["k"] * 200 + fit["ty"] == pytest.approx(300)
+
+
+def test_seed_positions_inherits_previous_coordinates(js):
+    result = run(
+        js,
+        """(() => {
+          const nodes = [{id: 1}, {id: 2}];
+          const prev = new Map([[1, {x: 10, y: 20, vx: 3, vy: 4}]]);
+          const inherited = meshgraphSeedPositions(nodes, prev, 800, 600);
+          return {inherited, nodes};
+        })()""",
+    )
+
+    assert result["inherited"] == 1
+    first, second = result["nodes"]
+    assert (first["x"], first["y"]) == (10, 20)
+    assert (first["vx"], first["vy"]) == (3, 4)
+    # Новый узел посеян на кругу: i = 1 → угол π → x = 400 − 180 ± 30.
+    assert 190 <= second["x"] <= 250
+    assert 270 <= second["y"] <= 330
+
+
+def test_seed_positions_reseeds_when_the_previous_one_is_broken(js):
+    result = run(
+        js,
+        """(() => {
+          const nodes = [{id: 1}];
+          const prev = new Map([[1, {x: NaN, y: 5}]]);
+          const inherited = meshgraphSeedPositions(nodes, prev, 800, 600);
+          return {inherited, x: nodes[0].x, y: nodes[0].y};
+        })()""",
+    )
+
+    assert result["inherited"] == 0
+    # i = 0 → угол 0: x = 400 + 180 ± 30, y = 300 ± 30.
+    assert 550 <= result["x"] <= 610
+    assert 270 <= result["y"] <= 330

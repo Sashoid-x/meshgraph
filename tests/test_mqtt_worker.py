@@ -550,3 +550,31 @@ def test_process_message_counts_undecryptable_packets(
     stats = worker.status()["stats"]
     assert stats["decrypt_failed"] == 1
     assert stats["decoded"] == 1  # пакет сохранён, счётчик лишь метит причину
+
+
+def test_settings_change_invalidates_the_graph_cache(settings_store, tmp_path):
+    """G-P2-5: сохранение настроек обязано сбрасывать кэш графа."""
+    from meshgraph import graph
+
+    settings_store.update(db_file=str(tmp_path / "cache.db"))
+    store.ensure_ready(settings_store.get())  # схемы ещё нет — создаём
+    graph.invalidate_cache()
+    graph.build_graph(settings_store.get(), mode="traceroute", use_cache=True)
+    assert graph._cache  # что-то закэшировано
+
+    worker = _worker(settings_store)
+    worker._on_settings_changed(settings_store.get())
+
+    assert not graph._cache  # диалог настроек снёс кэш
+
+
+def test_safe_db_stats_reports_counts_and_survives_a_broken_path(
+    settings, tmp_path
+):
+    # Обычный путь — грубые счётчики таблиц.
+    good = mqtt_worker._safe_db_stats(settings.db_file)
+    assert {"packets", "nodes", "traceroutes"} <= set(good)
+
+    # Нечитаемая база (каталог вместо файла) — ошибка, а не исключение.
+    bad = mqtt_worker._safe_db_stats(str(tmp_path))
+    assert "error" in bad

@@ -908,3 +908,90 @@ def test_node_snr_does_not_jump_when_the_mode_changes(settings):
     r_node = {n["id"]: n for n in rssi["nodes"]}[A]
 
     assert t_node["avg_snr"] == r_node["avg_snr"] == 7.5
+
+
+# ---------------------------------------------------------------------------
+# Cache eviction / TTL and leftover coverage (G-P2-5, G-P2-4.2)
+# ---------------------------------------------------------------------------
+
+
+def test_cache_evicts_the_least_recently_used_key(settings):
+    graph.invalidate_cache()
+    total = graph._CACHE_MAX_ENTRIES + 5
+    for hours in range(1, total + 1):
+        graph.build_graph(settings, mode="traceroute", hours=hours, use_cache=True)
+
+    assert len(graph._cache) <= graph._CACHE_MAX_ENTRIES
+    # Самый старый ключ вытеснен → повторный запрос обязан пересчитать.
+    misses = graph._cache_stats["misses"]
+    graph.build_graph(settings, mode="traceroute", hours=1, use_cache=True)
+    assert graph._cache_stats["misses"] == misses + 1
+
+
+def test_cache_entry_expires_after_the_ttl(settings, monkeypatch):
+    graph.invalidate_cache()
+    graph.build_graph(settings, mode="traceroute", use_cache=True)
+
+    # Данные не менялись, но время вышло → ключ устарел, будет пересчёт.
+    monkeypatch.setattr(graph, "_CACHE_TTL_SECONDS", 0.0)
+    misses = graph._cache_stats["misses"]
+    graph.build_graph(settings, mode="traceroute", use_cache=True)
+    assert graph._cache_stats["misses"] == misses + 1
+
+
+def test_indirect_suppressed_by_a_direct_link_in_reverse_direction(settings):
+    """G-P2-4: прямое ребро подавляет косвенное в обоих направлениях."""
+    # Direct hop stored as B→A — the opposite of the A→B case above; the
+    # sorted indirect key must be suppressed either way.
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=B,
+            to_node_id=A,
+            timestamp=time.time(),
+            portnum_name="TRACEROUTE_APP",
+            raw_payload=_route_payload(route=[], snr_towards=[40]),
+        ),
+    )
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=B,
+            to_node_id=A,
+            timestamp=time.time() - 60,
+            portnum_name="TRACEROUTE_APP",
+            raw_payload=_route_payload(route=[C], snr_towards=[40, 40]),
+        ),
+    )
+
+    payload = graph.build_graph(
+        settings, mode="traceroute", include_indirect=True, use_cache=False
+    )
+    pairs = {frozenset((l["source"], l["target"])) for l in payload["links"]}
+    assert frozenset((A, B)) in pairs
+    assert payload["indirect_connections"] == []
+
+
+def test_combined_survives_an_empty_traceroute_part(settings):
+    """G-P2-5: combined без единой трассировки — вложенная статистика честна."""
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=X,
+            gateway_node_id=GATEWAY,
+            snr=7.0,
+            rssi=-70,
+            hop_limit=3,
+            hop_start=3,
+            portnum_name="TELEMETRY_APP",
+        ),
+    )
+
+    payload = graph.build_graph(settings, mode="combined", use_cache=False)
+
+    assert payload["stats"]["mode"] == "combined"
+    assert payload["stats"]["traceroute"]["packets_with_rf_hops"] == 0
+    assert payload["stats"]["rssi"]["receptions_analyzed"] == 1
+    assert payload["nodes"]  # приёмы дали узлы
+    assert len(payload["links"]) == 1
+    assert payload["indirect_connections"] == []

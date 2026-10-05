@@ -198,8 +198,11 @@ def main() -> None:
         settings.web_port,
         store_ref.path,
     )
-    # Use the Werkzeug server: the MQTT worker is a thread in this process, so
-    # a single threaded server with the reloader disabled is what we want.
+    # threaded=True: API and polling requests must not queue behind each
+    # other while the MQTT worker threads run in this same process.  The
+    # reloader stays off deliberately — a Werkzeug reload restarts the whole
+    # process and would duplicate the capture (two subscriptions racing the
+    # same database), so keep exactly one worker alive (G-P2-4).
     app.run(
         host=settings.web_host,
         port=int(settings.web_port),
