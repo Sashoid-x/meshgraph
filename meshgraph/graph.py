@@ -41,8 +41,30 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LIMIT = 5000
 _CACHE_TTL_SECONDS = 20.0
+_CACHE_MAX_ENTRIES = 64
 _cache: dict[str, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
+# Single-flight: keys currently being rebuilt -> the event waiters block on
+# until the leader publishes its result (or fails).
+_inflight: dict[str, threading.Event] = {}
+
+
+def _cache_fresh_locked(key: str) -> dict | None:
+    """Return a non-expired payload; the caller already holds ``_cache_lock``.
+
+    A hit is re-inserted at the end of the dict, so insertion order doubles
+    as LRU order and eviction can drop the coldest key instead of clearing
+    the whole cache.
+    """
+    entry = _cache.get(key)
+    if entry is None:
+        return None
+    if time.time() - entry[0] >= _CACHE_TTL_SECONDS:
+        _cache.pop(key, None)
+        return None
+    _cache.pop(key, None)
+    _cache[key] = entry
+    return entry[1]
 
 
 # ---------------------------------------------------------------------------
@@ -697,36 +719,58 @@ def build_graph(
             str(bool(include_indirect)),
             channel or "-",
             str(limit),
+            # Changed data (new packet, prune) means a new key: fresh rows
+            # become visible immediately, without waiting for the TTL.
+            str(store.generation()),
         ]
     )
 
-    if use_cache:
+    def compute() -> dict[str, Any]:
+        if mode == "rssi":
+            return _build_rssi(
+                settings, hours, min_snr, include_indirect, channel, limit
+            )
+        if mode == "combined":
+            return _build_combined(
+                settings, hours, min_snr, include_indirect, channel, limit
+            )
+        return _build_traceroute(
+            settings, hours, min_snr, include_indirect, channel, limit
+        )
+
+    if not use_cache:
+        return compute()
+
+    # Single-flight: the first thread on a key becomes the leader and
+    # computes; everyone else waits for its event and re-checks the cache
+    # (a leader that failed raises and clears the way for a new one).
+    while True:
         with _cache_lock:
-            cached = _cache.get(cache_key)
-            if cached and time.time() - cached[0] < _CACHE_TTL_SECONDS:
-                return cached[1]
+            cached = _cache_fresh_locked(cache_key)
+            if cached is not None:
+                return cached
+            event = _inflight.get(cache_key)
+            if event is None:
+                _inflight[cache_key] = event = threading.Event()
+                break
+        event.wait()
 
-    if mode == "rssi":
-        payload = _build_rssi(
-            settings, hours, min_snr, include_indirect, channel, limit
-        )
-    elif mode == "combined":
-        payload = _build_combined(
-            settings, hours, min_snr, include_indirect, channel, limit
-        )
-    else:
-        payload = _build_traceroute(
-            settings, hours, min_snr, include_indirect, channel, limit
-        )
-
-    if use_cache:
+    try:
+        payload = compute()
+    except BaseException:
         with _cache_lock:
-            # Bound the cache so a stream of distinct filters can't grow it
-            # without limit.
-            if len(_cache) > 64:
-                _cache.clear()
-            _cache[cache_key] = (time.time(), payload)
+            _inflight.pop(cache_key, None)
+        event.set()
+        raise
 
+    with _cache_lock:
+        _cache[cache_key] = (time.time(), payload)
+        # Evict the least recently used key instead of clearing everything:
+        # a stream of distinct filters must not drop the hot one.
+        while len(_cache) > _CACHE_MAX_ENTRIES:
+            _cache.pop(next(iter(_cache)))
+        _inflight.pop(cache_key, None)
+    event.set()
     return payload
 
 

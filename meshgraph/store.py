@@ -28,6 +28,23 @@ _initialized_for: str | None = None
 # id is random 32-bit and wraps around over a node's lifetime.
 DEDUP_WINDOW_SECONDS = 600.0
 
+# Data generation for external caches (the graph cache keys off it): every
+# committed change to packets bumps it, so readers spot staleness immediately
+# instead of waiting for a TTL.
+_generation = 0
+
+
+def generation() -> int:
+    """Packet-data generation; bumps on every committed insert or prune."""
+    with _lock:
+        return _generation
+
+
+def _bump_generation() -> None:
+    """Mark packet data as changed (call while holding ``_lock``)."""
+    global _generation
+    _generation += 1
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS packets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,6 +297,7 @@ def insert_packet(db_file: str, packet: DecodedPacket) -> bool:
                 )
 
             conn.commit()
+            _bump_generation()
             return True
         finally:
             conn.close()
@@ -319,6 +337,7 @@ def prune(db_file: str, retention_hours: int) -> int:
                 )
             conn.commit()
             if deleted:
+                _bump_generation()
                 logger.info("Pruned %s packets older than %sh", deleted, retention_hours)
             return deleted
         finally:

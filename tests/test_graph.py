@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 from meshtastic import mesh_pb2
 
@@ -583,3 +586,71 @@ def test_cache_returns_identical_payload(seeded):
     third = graph.build_graph(seeded, mode="traceroute", use_cache=True)
     assert third is not first
     assert third["nodes"] == first["nodes"]
+
+
+def test_parallel_builds_compute_once(settings, monkeypatch):
+    """Single-flight: four concurrent misses on one key share one rebuild."""
+    calls = []
+    original = graph._build_traceroute
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        time.sleep(0.3)  # hold the flight open so the others have to queue
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(graph, "_build_traceroute", counting)
+    results = []
+
+    def worker():
+        results.append(graph.build_graph(settings, mode="traceroute", use_cache=True))
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(calls) == 1
+    assert all(payload is results[0] for payload in results)
+
+
+def test_insert_invalidates_cached_payload_immediately(settings):
+    """New packets must show up at once, not after the 20 s TTL (G-P0-3)."""
+    first = graph.build_graph(settings, mode="traceroute", use_cache=True)
+    assert first["nodes"] == []
+
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            to_node_id=0x8888,
+            gateway_node_id=GATEWAY,
+            portnum_name="TRACEROUTE_APP",
+            raw_payload=_route_payload(route=[], snr_towards=[40]),
+            mesh_packet_id=5,
+        ),
+    )
+
+    second = graph.build_graph(settings, mode="traceroute", use_cache=True)
+    assert second is not first
+    assert {node["id"] for node in second["nodes"]} == {A, 0x8888}
+
+    # A redelivered duplicate stores no row — the generation must not move,
+    # otherwise every retry would needlessly invalidate the cache.
+    generation = store.generation()
+    store.insert_packet(
+        settings.db_file,
+        make_packet(
+            from_node_id=A,
+            to_node_id=0x8888,
+            gateway_node_id=GATEWAY,
+            portnum_name="TRACEROUTE_APP",
+            raw_payload=_route_payload(route=[], snr_towards=[40]),
+            mesh_packet_id=5,  # the same packet that already sits in the table
+        ),
+    )
+    assert store.generation() == generation
+
+    # Unchanged data → same key → the cached object is served again.
+    third = graph.build_graph(settings, mode="traceroute", use_cache=True)
+    assert third is second
