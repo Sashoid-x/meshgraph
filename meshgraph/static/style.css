@@ -104,9 +104,12 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brand-mark { font-size: 22px; color: var(--accent); line-height: 1; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
-.brand-text strong { font-size: 14px; font-weight: 600; letter-spacing: .2px; }
+.brand-text strong { font-size: 14px; font-weight: 600; letter-spacing: .2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .brand-sub { font-size: 11px; color: var(--faint); font-family: var(--mono); }
 
+/* Слева: гамбургер сворачивания боковой панели + логотип. */
+.topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .topbar-right { display: flex; align-items: center; gap: 10px; }
 
 .status {
