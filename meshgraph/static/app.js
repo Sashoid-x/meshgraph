@@ -1441,6 +1441,69 @@ function initSidebar() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Sidebar: the whole panel collapses to the left edge (hamburger in topbar)
+// ---------------------------------------------------------------------------
+
+// Держать в синхроне с @media (max-width: 900px) в style.css и inline-скриптом
+// в index.html: на узких экранах панель — выдвижной ящик поверх графа.
+const SIDEBAR_MOBILE_QUERY = "(max-width: 900px)";
+const SIDEBAR_KEY = "meshgraph.sidebar.collapsed";
+
+function sidebarIsMobile() {
+  return window.matchMedia(SIDEBAR_MOBILE_QUERY).matches;
+}
+
+function setSidebarCollapsed(collapsed, persist) {
+  document
+    .querySelector(".layout")
+    .classList.toggle("sidebar-collapsed", collapsed);
+  const btn = $("sidebarBtn");
+  if (btn) {
+    btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    const title = collapsed
+      ? "Показать боковую панель"
+      : "Свернуть боковую панель";
+    btn.title = title;
+    btn.setAttribute("aria-label", title);
+  }
+  // Выбор запоминаем только для десктопа: мобильный ящик всегда стартует
+  // закрытым и не должен менять десктопное предпочтение.
+  if (persist && !sidebarIsMobile()) {
+    storeSet(SIDEBAR_KEY, collapsed ? "1" : "");
+  }
+  // Ширина холста изменилась → перерисовка под неё (существующий обработчик
+  // resize сам делает паузу 250 мс — анимация успевает закончиться).
+  // Мобильный ящик лежит поверх графа и холст не трогает — без лишнего
+  // запроса.
+  if (!sidebarIsMobile()) window.dispatchEvent(new Event("resize"));
+}
+
+function initSidebarToggle() {
+  // Стартовое состояние inline-скрипт в index.html уже поставил без вспышки —
+  // здесь синхронизируем aria/title и вешаем обработчики.
+  const layout = document.querySelector(".layout");
+  setSidebarCollapsed(layout.classList.contains("sidebar-collapsed"), false);
+
+  $("sidebarBtn").addEventListener("click", () =>
+    setSidebarCollapsed(!layout.classList.contains("sidebar-collapsed"), true)
+  );
+  // Тап по затемнению закрывает мобильный ящик (на десктопе его нет).
+  $("sidebarBackdrop").addEventListener("click", () =>
+    setSidebarCollapsed(true, true)
+  );
+  // Переход через границу экрана: на мобильных ящик всегда закрыт, на
+  // десктопе возвращается сохранённое состояние.
+  try {
+    window.matchMedia(SIDEBAR_MOBILE_QUERY).addEventListener("change", () => {
+      setSidebarCollapsed(
+        sidebarIsMobile() || storeGet(SIDEBAR_KEY) === "1",
+        false
+      );
+    });
+  } catch { /* старые браузеры без addEventListener на matchMedia */ }
+}
+
 const THEME_KEY = "meshgraph.theme";
 
 function currentTheme() {
@@ -1477,6 +1540,7 @@ function initTheme() {
 function init() {
   initTheme();
   initSidebar();
+  initSidebarToggle();
   initChat();
 
   document.querySelectorAll('input[name="mode"]').forEach((radio) => {
@@ -1490,6 +1554,14 @@ function init() {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       if (!$("settingsModal").hidden) closeSettings();
+      // Мобильный ящик — тоже оверлей: первый Escape его закрывает…
+      else if (
+        sidebarIsMobile() &&
+        !document.querySelector(".layout").classList.contains("sidebar-collapsed")
+      ) {
+        setSidebarCollapsed(true, false);
+      }
+      // …и только потом снимается выделение.
       else select(null, null);
     }
   });

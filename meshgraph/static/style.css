@@ -182,6 +182,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
   display: grid;
   grid-template-columns: var(--sidebar-w) 1fr;
   height: calc(100vh - var(--topbar-h));
+  /* Панель при сворачивании уезжает за левый край — обрезаем, чтобы не
+     появился горизонтальный скролл. */
+  overflow: hidden;
+  transition: grid-template-columns .2s ease;
 }
 
 .sidebar {
@@ -192,10 +196,34 @@ button, input, select, textarea { font: inherit; color: inherit; }
   display: flex;
   flex-direction: column;
   gap: 14px;
+  /* Не сжимается вместе с колонкой: пока колонка схлопывается, панель
+     уезжает влево целым куском — содержимое не мнётся при анимации. */
+  min-width: var(--sidebar-w);
+  transition: transform .2s ease;
 }
 .sidebar::-webkit-scrollbar { width: 9px; }
 .sidebar::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px; }
 .sidebar::-webkit-scrollbar-track { background: transparent; }
+
+/* Свёрнутая панель: колонка схлопывается в 0, сама панель уезжает влево,
+   граф занимает всю ширину. Управляет классом кнопка #sidebarBtn (app.js). */
+.layout.sidebar-collapsed { grid-template-columns: 0 1fr; }
+.layout.sidebar-collapsed .sidebar {
+  transform: translateX(-100%);
+  border-right: none;
+}
+
+/* Затемнение под мобильным ящиком панели (см. @media ниже). */
+.sidebar-backdrop {
+  display: none;
+  position: fixed;
+  top: var(--topbar-h);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, .45);
+  z-index: 45;
+}
 
 .panel {
   background: var(--panel);
@@ -703,8 +731,49 @@ legend {
 /* -------------------------------------------------------------- responsive */
 
 @media (max-width: 900px) {
-  .layout { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; }
-  .sidebar { border-right: none; border-bottom: 1px solid var(--border); max-height: 45vh; }
-  .canvas-wrap { height: 60vh; }
+  /* Мобильная раскладка: граф занимает весь экран под шапкой, панель —
+     выдвижной ящик поверх холста. Класс sidebar-collapsed ставит app.js (и
+     inline-скрипт в index.html) до первой отрисовки: по умолчанию ящик
+     закрыт. Медиазапрос держать в синхроне с SIDEBAR_MOBILE_QUERY в app.js. */
+  .layout,
+  .layout.sidebar-collapsed {
+    grid-template-columns: 1fr;
+    height: calc(100vh - var(--topbar-h));
+    /* Динамическая высота: URL-бар мобильного браузера не режет холст. */
+    height: calc(100dvh - var(--topbar-h));
+  }
+  .sidebar {
+    position: fixed;
+    top: var(--topbar-h);
+    left: 0;
+    bottom: 0;
+    width: min(320px, 88vw);
+    min-width: 0;
+    max-height: none;
+    transform: translateX(-100%);
+    transition: transform .2s ease;
+    z-index: 50;
+    box-shadow: 10px 0 28px rgba(0, 0, 0, .35);
+  }
+  .layout:not(.sidebar-collapsed) .sidebar { transform: none; }
+  .layout:not(.sidebar-collapsed) .sidebar-backdrop { display: block; }
+
+  /* Шапке не хватает места под кнопки — ужимаем подпись. */
+  .brand-sub { display: none; }
   #settingsBtn span { display: none; }
+}
+
+@media (max-width: 560px) {
+  .topbar { padding: 0 10px; gap: 8px; }
+  .brand-text strong { font-size: 13px; }
+  .status { padding: 5px 8px; }
+  /* Остаётся только точка состояния: счётчики и текст не помещаются. */
+  .status #statusText,
+  .status .status-sep,
+  .status #statusCounters { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .layout,
+  .sidebar { transition: none; }
 }

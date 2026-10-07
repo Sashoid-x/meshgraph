@@ -103,6 +103,28 @@ def test_sidebar_sections_are_foldable(client):
     assert 'hasAttribute("data-nofold")' in app_js
 
 
+def test_sidebar_collapses_to_the_left_edge(client):
+    """Гамбургер в шапке сворачивает панель к краю; на мобильных — ящик."""
+    body = client.get("/").get_data(as_text=True)
+    assert 'id="sidebarBtn"' in body
+    assert 'aria-controls="sidebarPanel"' in body
+    assert 'id="sidebarPanel"' in body
+    # Затемнение под мобильным ящиком и стартовое состояние без вспышки.
+    assert 'id="sidebarBackdrop"' in body
+    assert "meshgraph.sidebar.collapsed" in body
+
+    static = Path(__file__).resolve().parents[1] / "meshgraph" / "static"
+    app_js = (static / "app.js").read_text(encoding="utf-8")
+    assert "setSidebarCollapsed" in app_js
+    # Граница мобильной раскладки обязана совпадать в JS и CSS (900px).
+    assert '(max-width: 900px)' in app_js
+    css = (static / "style.css").read_text(encoding="utf-8")
+    assert "@media (max-width: 900px)" in css
+    # Свёрнутая панель: колонка в 0 и уезд влево целым куском.
+    assert ".layout.sidebar-collapsed" in css
+    assert "translateX(-100%)" in css
+
+
 def test_theme_toggle(client):
     """Переключатель темы: кнопка в шапке, выбор до отрисовки, светлый блок CSS."""
     body = client.get("/").get_data(as_text=True)
