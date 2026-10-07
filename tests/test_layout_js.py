@@ -115,6 +115,28 @@ def test_same_structure_without_previous_render(js):
     assert run(js, "meshgraphSameStructure(null, meshgraphIslandKey([[1]]))") is False
 
 
+def test_can_freeze_when_refresh_changes_nothing(js):
+    # Структура, холст и прошлая симуляция не изменились → свежую симуляцию
+    # гасим: иначе перегрев alpha=1 дёргал граф каждое автообновление.
+    assert run(js, "meshgraphCanFreeze(true, true, 800, 600, 800, 600)") is True
+
+
+def test_can_freeze_rejects_changed_structure_or_unsettled_sim(js):
+    # Изменение структуры — раскладка должна пересчитаться (симуляция идёт).
+    assert run(js, "meshgraphCanFreeze(false, true, 800, 600, 800, 600)") is False
+    # Прошлая симуляция ещё в полёте (фильтр поменяли пару секунд назад) —
+    # запускаем новую, чтобы layout доуспел доехать, а не замораживали бык.
+    assert run(js, "meshgraphCanFreeze(true, false, 800, 600, 800, 600)") is False
+    # Первый показ: нет ни прежней симуляции, ни прежнего размера.
+    assert run(js, "meshgraphCanFreeze(null, null, 800, 600, undefined, undefined)") is False
+
+
+def test_can_freeze_rejects_canvas_resize(js):
+    # Ресайз: центр/ячейки пересчитываются под новый холст.
+    assert run(js, "meshgraphCanFreeze(true, true, 700, 600, 800, 600)") is False
+    assert run(js, "meshgraphCanFreeze(true, true, 800, 500, 800, 600)") is False
+
+
 # ---------------------------------------------------------------------------
 # Packing
 # ---------------------------------------------------------------------------
@@ -400,6 +422,20 @@ def test_app_js_still_compiles():
     """Compile (not run) app.js: syntax errors fail the suite without a browser."""
     ctx = quickjs.Context()
     ctx.eval("(function(){\n" + APP_JS.read_text(encoding="utf-8") + "\n})")
+
+
+def test_refresh_wiring_freezes_and_stays_silent():
+    """Фоновое обновление не дёргает граф и не моргает оверлеем.
+
+    Строковые проверки каркаса: renderGraph решает заморозку через
+    meshgraphCanFreeze и гасит свежую симуляцию, а автообновление идёт через
+    loadGraph({silent: true}) без спиннера поверх холста.
+    """
+    src = APP_JS.read_text(encoding="utf-8")
+    assert "meshgraphCanFreeze(" in src
+    # Заморозка унаследованных позиций (иначе перегрев alpha=1 дёргал узлы).
+    assert "simulation.alpha(0);" in src
+    assert "loadGraph({ silent: true })" in src
 
 
 # ---------------------------------------------------------------------------

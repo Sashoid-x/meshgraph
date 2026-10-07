@@ -107,7 +107,13 @@ function currentParams() {
   return params;
 }
 
-async function loadGraph() {
+/**
+ * `silent` — фоновое обновление (автообновление раз в минуту): граф остаётся
+ * видимым без оверлея со спиннером, который моргал поверх холста каждые
+ * AUTO_REFRESH_MS. Оверлей показывают только пользовательские действия
+ * (первичная загрузка, смена фильтров, ресайз).
+ */
+async function loadGraph({ silent = false } = {}) {
   if (state.loading) return;
   if (state.dragging) {
     // Не перерисовываем под курсором: узел ещё тянут. Обновление выполнится
@@ -117,8 +123,7 @@ async function loadGraph() {
   }
   state.loading = true;
   state.pendingReload = false;
-  showOverlay("loading", true);
-  hideMessage();
+  if (!silent) showOverlay("loading", true);
 
   try {
     const response = await fetch(`/api/graph?${currentParams().toString()}`);
@@ -139,7 +144,7 @@ async function loadGraph() {
     showMessage("Не удалось загрузить граф", String(error.message || error));
   } finally {
     state.loading = false;
-    showOverlay("loading", false);
+    if (!silent) showOverlay("loading", false);
   }
 }
 
@@ -216,10 +221,18 @@ function renderGraph(data, prevNodes = null) {
     );
     return;
   }
+  // Данные пришли — прежнее сообщение («нет данных» / ошибка загрузки)
+  // снимаем здесь, а не в начале loadGraph: фоновое обновление иначе
+  // убирало карточку на время fetch и карточка мигала каждую минуту.
+  hideMessage();
 
   const rect = container.node().getBoundingClientRect();
   let width = rect.width || 900;
   let height = rect.height || 600;
+  // Прежние размеры холста — для meshgraphCanFreeze (ресайз отменяет
+  // заморозку: центр/ячейки нужно пересчитать под новый размер).
+  const prevWidth = state.width;
+  const prevHeight = state.height;
   state.width = width;
   state.height = height;
 
@@ -264,6 +277,23 @@ function renderGraph(data, prevNodes = null) {
   // Несколько несвязанных частей → каждая уезжает в свою ячейку упаковки.
   const spreadIslands = islands.length > 1;
 
+  // Заморозка повторного рендера (layout.js: meshgraphCanFreeze). Свежая
+  // симуляция всегда стартует с alpha=1 и даже на идентичных данных
+  // «дыхала» layout на сотни пикселей каждые AUTO_REFRESH_MS: перегрев
+  // повторно раскручивал уже устоявшиеся силы. Если структура, холст и прошлая
+  // симуляция не изменились — позиции наследуются и симуляция замораживается
+  // (alpha=0), ноль движения. Перетаскивание явно будит её через
+  // alphaTarget().restart().
+  const prevSim = state.simulation;
+  const freeze = meshgraphCanFreeze(
+    structureSame,
+    !prevSim || prevSim.alpha() <= prevSim.alphaMin(),
+    width,
+    height,
+    prevWidth,
+    prevHeight
+  );
+
   let simulation = d3
     .forceSimulation(data.nodes)
     .force(
@@ -297,6 +327,12 @@ function renderGraph(data, prevNodes = null) {
 
     if (reuseTargets) {
       targets = state.islandTargets;
+      // Ничего не двигаем: ячейки унаследованы, позиции унаследованы, а
+      // свежую симуляцию гасим — иначе она тут же раскрутится с alpha=1.
+      if (freeze) {
+        simulation.stop();
+        simulation.alpha(0);
+      }
     } else {
       // Части сначала «собираются» на месте, чтобы замер был честным; затем
       // каждая уезжает в свою ячейку упаковки — как единое целое.
@@ -329,6 +365,10 @@ function renderGraph(data, prevNodes = null) {
   } else {
     // Одна связная сеть — обычные силы, центр держит её на экране.
     simulation.force("center", d3.forceCenter(width / 2, height / 2));
+    if (freeze) {
+      simulation.stop();
+      simulation.alpha(0);
+    }
   }
 
   state.simulation = simulation;
@@ -461,7 +501,11 @@ function renderGraph(data, prevNodes = null) {
   });
 
   // -- tick ----------------------------------------------------------------
-  simulation.on("tick", () => {
+  // Отрисовка позиций → DOM. Отдельная функция, а не только колбэк tick:
+  // замороженная симуляция (автообновление, meshgraphCanFreeze) не тикает
+  // никогда, и первый вызов обязан пройти синхронно — иначе узлы и связи
+  // остались бы в (0,0).
+  const redraw = () => {
     link
       .attr("x1", (d) => d.source.x)
       .attr("y1", (d) => d.source.y)
@@ -473,7 +517,9 @@ function renderGraph(data, prevNodes = null) {
       .attr("x2", (d) => d.target.x)
       .attr("y2", (d) => d.target.y);
     node.attr("transform", (d) => `translate(${d.x},${d.y})`);
-  });
+  };
+  simulation.on("tick", redraw);
+  redraw();
 }
 
 // ---------------------------------------------------------------------------
@@ -1482,7 +1528,9 @@ function init() {
     if (document.hidden) return;
     if (!$("settingsModal").hidden) return;
     loadChannels();
-    loadGraph();
+    // Фоновое обновление — без оверлея со спиннером: граф не моргает
+    // каждые AUTO_REFRESH_MS (см. loadGraph({silent})).
+    loadGraph({ silent: true });
   }, AUTO_REFRESH_MS);
 }
 

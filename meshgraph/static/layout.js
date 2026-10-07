@@ -313,6 +313,35 @@ function meshgraphSameStructure(prev, next) {
 }
 
 /**
+ * Whether a re-render may freeze the fresh simulation instead of reheating
+ * it.  A new `d3.forceSimulation` always starts at `alpha = 1` and even with
+ * identical data re-runs the forces, moving nodes by hundreds of pixels —
+ * the graph visibly jiggles on every auto-refresh.  Freezing (alpha = 0,
+ * `stop()`) keeps the inherited positions exactly in place, so it is allowed
+ * only when nothing that shapes the layout changed:
+ *
+ * - `structureSame`  — the island structure is identical (meshgraphSameStructure);
+ * - `prevSettled`    — the previous simulation decayed to alphaMin (or there
+ *                      was none); an in-flight one must be allowed to finish;
+ * - canvas size      — on resize the centre/cells must be recomputed.
+ */
+function meshgraphCanFreeze(
+  structureSame,
+  prevSettled,
+  width,
+  height,
+  prevWidth,
+  prevHeight
+) {
+  return (
+    !!structureSame &&
+    !!prevSettled &&
+    width === prevWidth &&
+    height === prevHeight
+  );
+}
+
+/**
  * d3-style force: nudges nodes off link lines they are NOT part of, so a node
  * never appears to sit on someone else's connection.  For every node the
  * perpendicular distance to every foreign segment is computed.  Inside the
