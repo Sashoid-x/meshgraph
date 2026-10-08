@@ -42,6 +42,9 @@
   </div>
 
   <div class="topbar-right">
+    <select id="serverSwitch" class="server-switch"
+            title="Активный сервер: переключение между включёнными подключениями работает без пароля"></select>
+
     <div class="status" id="mqttStatus" title="Состояние MQTT-подключения">
       <span class="dot" id="statusDot"></span>
       <span id="statusText">подключение…</span>
@@ -233,6 +236,17 @@
       <button class="icon-btn" id="settingsClose" aria-label="Закрыть">✕</button>
     </div>
 
+    <div class="unlock-panel" id="unlockPanel" hidden>
+      <p class="hint">Настройки защищены паролем. Просмотр графа и переключение
+        между включёнными серверами работают без него.</p>
+      <div class="unlock-row">
+        <input id="unlockPassword" type="password" autocomplete="current-password"
+               placeholder="Пароль настроек">
+        <button class="btn btn-primary" id="unlockBtn" type="button">Разблокировать</button>
+      </div>
+      <div class="form-errors" id="unlockErrors" hidden></div>
+    </div>
+
     <form id="settingsForm" class="modal-body">
       <fieldset>
         <legend>Подключение</legend>
@@ -250,6 +264,7 @@
         </div>
         <div class="hint" id="connDbHint">Файл базы данных: <code id="connDbFile">—</code>.
           При удалении подключения файл остаётся на диске — ничего не теряется.</div>
+        <div class="conn-list" id="connList"></div>
         <button class="btn btn-ghost btn-danger" id="connDelete" type="button">Удалить подключение</button>
       </fieldset>
 
@@ -346,6 +361,21 @@
             <label for="setLimit">Лимит пакетов на построение</label>
             <input id="setLimit" name="graph_packet_limit" type="number" min="100" max="100000" value="5000">
           </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Безопасность</legend>
+        <div class="field">
+          <label for="setSettingsPassword">Пароль на настройки</label>
+          <input id="setSettingsPassword" type="password" autocomplete="new-password"
+                 placeholder="не задан — настройки открыты">
+          <div class="hint" id="passwordHint">Пароль запрашивается при открытии
+            настроек и живёт до перезагрузки страницы.</div>
+        </div>
+        <div class="inline-actions">
+          <button class="btn btn-ghost" id="passwordSave" type="button">Задать пароль</button>
+          <button class="btn btn-ghost btn-danger" id="passwordClear" type="button" hidden>Снять пароль</button>
         </div>
       </fieldset>
 

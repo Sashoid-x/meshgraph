@@ -453,6 +453,28 @@ def test_page_wires_the_connection_selector(client):
     assert 'addEventListener("submit"' in app_js
 
 
+def test_page_wires_the_switcher_manager_and_password_ui(client):
+    body = client.get("/").get_data(as_text=True)
+    # Публичный переключатель серверов живёт в шапке — без пароля.
+    assert 'id="serverSwitch"' in body
+    # Панель разблокировки настроек по паролю.
+    assert 'id="unlockPanel"' in body
+    assert 'id="unlockPassword"' in body
+    assert 'id="unlockBtn"' in body
+    assert 'id="unlockErrors"' in body
+    # Менеджер серверов (вкл/выкл) и раздел «Безопасность» в диалоге.
+    assert 'id="connList"' in body
+    assert 'id="setSettingsPassword"' in body
+    assert 'id="passwordSave"' in body
+    assert 'id="passwordClear"' in body
+    app_js = (Path(web.PACKAGE_DIR) / "static" / "app.js").read_text(encoding="utf-8")
+    # Пароль уходит заголовком, а не телом, и хранится до перезагрузки страницы.
+    assert "X-Settings-Password" in app_js
+    assert "settingsHeaders" in app_js
+    assert "/api/settings/password" in app_js
+    assert "/api/connections/" in app_js  # включение/выключение серверов
+
+
 def test_status_reports_the_active_connection(client):
     payload = client.get("/api/status").get_json()
     assert payload["connection"]["id"]

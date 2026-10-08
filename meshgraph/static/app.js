@@ -1200,6 +1200,9 @@ async function pollStatus() {
     if (!response.ok) return;
     const status = await response.json();
 
+    updateServerSwitch(status);
+    updateConnectionStates();
+
     const dot = $("statusDot");
     dot.className = "dot " + (status.connected ? "on" : "off");
     $("statusText").textContent = status.connected
@@ -1326,6 +1329,84 @@ let activeConnectionId = "";
 let newConnectionMode = false;
 let lastSettings = null;
 
+// Пароль настроек живёт в памяти страницы до перезагрузки: он открывает
+// только модалку настроек — график/чат и переключение серверов ему не нужны.
+let settingsPassword = null;
+// Последний /api/status: состояния серверов для списка и переключателя.
+let lastStatusConnections = [];
+let serverSwitchSignature = null;
+
+function settingsHeaders(extra) {
+  const headers = Object.assign({}, extra);
+  if (settingsPassword !== null) headers["X-Settings-Password"] = settingsPassword;
+  return headers;
+}
+
+async function settingsFetch(path, options) {
+  // Запрос к защищённому эндпоинту: 401/403 сбрасывают сохранённый пароль
+  // и открывают панель разблокировки, чтобы ввести его заново.
+  const response = await fetch(
+    path,
+    Object.assign({}, options, {
+      headers: settingsHeaders((options && options.headers) || {}),
+    })
+  );
+  if (response.status === 401 || response.status === 403) {
+    settingsPassword = null;
+    if (!$("settingsModal").hidden) showUnlockPanel(true);
+    throw new Error("Настройки защищены паролем — введите пароль.");
+  }
+  return response;
+}
+
+function showUnlockPanel(visible) {
+  $("unlockPanel").hidden = !visible;
+  $("settingsForm").hidden = visible;
+  $("settingsSave").disabled = visible;
+  if (visible) {
+    showUnlockErrors([]);
+    setTimeout(() => $("unlockPassword").focus(), 50);
+  }
+}
+
+function showUnlockErrors(errors) {
+  const box = $("unlockErrors");
+  if (!errors || !errors.length) {
+    box.hidden = true;
+    return;
+  }
+  box.innerHTML = `<ul>${errors.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}</ul>`;
+  box.hidden = false;
+}
+
+async function unlockSettings() {
+  const value = $("unlockPassword").value;
+  if (!value) {
+    showUnlockErrors(["Введите пароль."]);
+    return;
+  }
+  try {
+    const response = await fetch("/api/settings", {
+      headers: { "X-Settings-Password": value },
+    });
+    if (response.status === 401) {
+      showUnlockErrors(["Неверный пароль."]);
+      return;
+    }
+    if (!response.ok) {
+      showUnlockErrors([`Ошибка HTTP ${response.status}`]);
+      return;
+    }
+    settingsPassword = value;
+    $("unlockPassword").value = "";
+    showUnlockPanel(false);
+    applySettings(await response.json());
+    setTimeout(() => $("setBroker").focus(), 50);
+  } catch (error) {
+    showUnlockErrors([String(error)]);
+  }
+}
+
 function applySettings(settings) {
   lastSettings = settings;
   activeConnectionId = settings.active_connection || "";
@@ -1347,6 +1428,8 @@ function applySettings(settings) {
     input.value = value === null || value === undefined ? "" : value;
   });
   populateConnectionSelect(settings);
+  renderConnectionList(settings);
+  updatePasswordUi(settings);
   updateTopicPreview();
 }
 
@@ -1383,6 +1466,251 @@ function updateConnectionDbHint(settings) {
   if (del) del.disabled = (settings.connections || []).length <= 1;
 }
 
+// ---------------------------------------------------------------------------
+// Manager list, per-server states and the public header switcher
+// ---------------------------------------------------------------------------
+
+function renderConnectionList(settings) {
+  // «Менеджер серверов» внутри настроек: у каждой строки — тумблер фонового
+  // сбора; клик по имени переключает активное подключение (как и селект).
+  const box = $("connList");
+  if (!box) return;
+  box.innerHTML = "";
+  const profiles = settings.connections || [];
+  if (!profiles.length) return;
+
+  const head = document.createElement("div");
+  head.className = "conn-list-head";
+  head.textContent = "Серверы — вкл/выкл фонового сбора:";
+  box.appendChild(head);
+
+  profiles.forEach((profile) => {
+    const row = document.createElement("div");
+    row.className =
+      "conn-row" + (profile.id === settings.active_connection ? " active" : "");
+    row.dataset.id = profile.id;
+
+    const main = document.createElement("button");
+    main.type = "button";
+    main.className = "conn-row-main";
+    main.title = `${profile.broker}:${profile.port} · ${profile.topic}\nБаза: ${profile.db_file}`;
+    const name = document.createElement("span");
+    name.className = "conn-row-name";
+    name.textContent = profile.name || profile.id;
+    const meta = document.createElement("span");
+    meta.className = "conn-row-meta";
+    meta.textContent = `${profile.broker}:${profile.port} · ${profile.topic}`;
+    main.append(name, meta);
+    main.addEventListener("click", () => {
+      if (!newConnectionMode && profile.id === activeConnectionId) return;
+      switchConnection(profile.id);
+    });
+
+    const state = document.createElement("span");
+    state.className = "conn-row-state";
+    state.dataset.id = profile.id;
+    state.title = profile.enabled
+      ? "состояние подключения"
+      : "выключен — данные не собираются";
+
+    const toggle = document.createElement("label");
+    toggle.className = "switch";
+    toggle.title = profile.enabled
+      ? "Сбор данных включён — нажмите, чтобы выключить"
+      : "Сбор данных выключен — нажмите, чтобы включить";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(profile.enabled);
+    input.addEventListener("change", () => toggleConnection(profile.id, input.checked));
+    const knob = document.createElement("span");
+    toggle.append(input, knob);
+
+    row.append(main, state, toggle);
+    box.appendChild(row);
+  });
+  updateConnectionStates();
+}
+
+function updateConnectionStates() {
+  // Точки состояния в списке — из последнего опроса статуса (без
+  // перерисовки строк, чтобы не сбивать фокус в открытой форме).
+  const box = $("connList");
+  if (!box) return;
+  box.querySelectorAll(".conn-row").forEach((row) => {
+    const dot = row.querySelector(".conn-row-state");
+    if (!dot) return;
+    const info = lastStatusConnections.find((c) => c.id === row.dataset.id);
+    dot.className = "conn-row-state";
+    if (!info) {
+      dot.title = "";
+      return;
+    }
+    dot.classList.toggle("on", Boolean(info.connected));
+    dot.classList.toggle("off", !info.connected);
+    dot.title = info.error
+      ? info.error
+      : info.connected
+        ? "подключено"
+        : info.enabled
+          ? "нет связи"
+          : "выключено";
+  });
+}
+
+function updateServerSwitch(status) {
+  // Публичный переключатель в шапке: только включённые серверы (плюс
+  // активный, чтобы выбор не пропадал, если его выключили).
+  const select = $("serverSwitch");
+  if (!select) return;
+  const all = status.connections || [];
+  lastStatusConnections = all;
+  const list = all.filter((c) => c.enabled || c.active);
+  const signature = list.map((c) => `${c.id}:${c.name}`).join("\u0001");
+  if (signature !== serverSwitchSignature) {
+    serverSwitchSignature = signature;
+    select.innerHTML = "";
+    list.forEach((c) => {
+      const option = document.createElement("option");
+      option.value = c.id;
+      option.textContent = c.name || c.id;
+      select.appendChild(option);
+    });
+  }
+  const activeId = status.connection ? status.connection.id : "";
+  if (activeId && select.value !== activeId) select.value = activeId;
+  select.title =
+    "Серверы:\n" +
+    all
+      .map((c) => {
+        const mark = c.connected ? "●" : "○";
+        const off = c.enabled ? "" : " (выкл)";
+        const err = c.error ? ` — ${c.error}` : "";
+        return `${mark} ${c.name || c.id}${off}${err}`;
+      })
+      .join("\n");
+}
+
+async function switchFromHeader(pid) {
+  // Переключение без пароля: сервер сам разрешит только включённые цели.
+  try {
+    const response = await fetch("/api/connections/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: pid }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) {
+      showMessage(
+        "Не удалось переключиться",
+        (result.errors || [`Ошибка HTTP ${response.status}`]).join("\n")
+      );
+      return;
+    }
+    activeConnectionId = result.settings.active_connection || pid;
+    lastSettings = result.settings;
+    if (!$("settingsModal").hidden && settingsPassword !== null) {
+      applySettings(result.settings);
+    }
+    reloadGraphData();
+  } catch (error) {
+    showMessage("Не удалось переключиться", String(error));
+  }
+}
+
+async function toggleConnection(pid, enabled) {
+  // Вкл/выкл сервера в менеджере: выключенный клиент у воркера снимается,
+  // история остаётся в его базе и включается обратно тем же переключателем.
+  try {
+    const beforeActive = activeConnectionId;
+    const response = await settingsFetch(
+      `/api/connections/${encodeURIComponent(pid)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      }
+    );
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      showFormErrors(result.errors || [`Ошибка HTTP ${response.status}`]);
+      if (lastSettings) applySettings(lastSettings);  // вернуть тумблеры
+      return;
+    }
+    showFormErrors([]);
+    const profile = (result.settings.connections || []).find((p) => p.id === pid);
+    const label = (profile && profile.name) || pid;
+    applySettings(result.settings);
+    $("settingsHint").textContent = enabled
+      ? `«${label}» включён: подключение установится за секунду, сбор начнётся.`
+      : `«${label}» выключен: сбор остановлен, история в его базе сохранена.`;
+    pollStatus();
+    if (result.settings.active_connection !== beforeActive) reloadGraphData();
+  } catch (error) {
+    showFormErrors([String(error)]);
+  }
+}
+
+function updatePasswordUi(settings) {
+  const set = Boolean(settings.settings_password_set);
+  const input = $("setSettingsPassword");
+  if (!input) return;
+  input.placeholder = set
+    ? "пароль задан — введите новый, чтобы сменить"
+    : "не задан — настройки открыты";
+  const clear = $("passwordClear");
+  if (clear) clear.hidden = !set;
+  const save = $("passwordSave");
+  if (save) save.textContent = set ? "Сменить пароль" : "Задать пароль";
+  const hint = $("passwordHint");
+  if (hint) {
+    hint.textContent = set
+      ? "Пароль спрашивается при открытии настроек и хранится до перезагрузки страницы. Граф, чат и переключение между включёнными серверами работают без него."
+      : "Пароль не задан — настройки открыты. Задайте его, чтобы ограничить управление серверами и настройками.";
+  }
+}
+
+async function postSettingsPassword(value) {
+  try {
+    const response = await settingsFetch("/api/settings/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: value }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      showFormErrors(result.errors || [`Ошибка HTTP ${response.status}`]);
+      return;
+    }
+    showFormErrors([]);
+    // Новый пароль — сразу в память страницы: старый в заголовке не пройдёт.
+    settingsPassword = value || null;
+    $("setSettingsPassword").value = "";
+    applySettings(result.settings);
+    $("settingsHint").textContent = value
+      ? "Пароль сохранён: при следующем открытии настроек его спросят."
+      : "Пароль снят — настройки открыты без него.";
+  } catch (error) {
+    showFormErrors([String(error)]);
+  }
+}
+
+function saveSettingsPassword() {
+  const value = $("setSettingsPassword").value;
+  if (!value) {
+    showFormErrors(["Введите новый пароль (не короче 4 символов)."]);
+    return;
+  }
+  postSettingsPassword(value);
+}
+
+function clearSettingsPassword() {
+  const confirmed = window.confirm(
+    "Снять пароль с настроек?\n\nК ним будет доступ без него — любым, у кого есть ссылка."
+  );
+  if (!confirmed) return;
+  postSettingsPassword("");
+}
+
 function enterNewConnectionMode() {
   // «Новое подключение» начинается с копии текущего: брокер, порт, TLS,
   // учётные данные и ключи уже на месте — меняется только нужное (чаще
@@ -1407,14 +1735,25 @@ async function switchConnection(pid) {
   try {
     const response = await fetch("/api/connections/select", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: settingsHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ id: pid }),
     });
-    const result = await response.json();
+    const result = await response.json().catch(() => ({}));
+    if (response.status === 401 || response.status === 403) {
+      // Выключенный сервер без пароля недоступен — предложить разблокировку.
+      settingsPassword = null;
+      showUnlockPanel(true);
+      return;
+    }
     if (!response.ok || !result.ok) {
       showFormErrors(result.errors || [`Ошибка HTTP ${response.status}`]);
       // Переключение не вышло — вернуть селектор к серверному состоянию.
-      fetch("/api/settings").then((r) => r.json()).then(applySettings).catch(() => {});
+      fetch("/api/settings", { headers: settingsHeaders() })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((settings) => {
+          if (settings) applySettings(settings);
+        })
+        .catch(() => {});
       return;
     }
     showFormErrors([]);
@@ -1453,7 +1792,7 @@ async function deleteConnection() {
   );
   if (!confirmed) return;
   try {
-    const response = await fetch(
+    const response = await settingsFetch(
       `/api/connections/${encodeURIComponent(activeConnectionId)}`,
       { method: "DELETE" }
     );
@@ -1484,11 +1823,31 @@ function openSettings() {
   $("settingsModal").hidden = false;
   $("formErrors").hidden = true;
   $("settingsHint").textContent = "Изменения применяются сразу: соединение переустанавливается.";
+  const loaded = (settings) => {
+    showUnlockPanel(false);
+    applySettings(settings);
+    setTimeout(() => $("setBroker").focus(), 50);
+  };
+  if (settingsPassword !== null) {
+    settingsFetch("/api/settings")
+      .then((r) => r.json())
+      .then(loaded)
+      .catch((error) => showFormErrors([`Не удалось прочитать настройки: ${error}`]));
+    return;
+  }
+  // Пароль ещё не вводили: пробуем открыть без него — 401 приходит, только
+  // если он вообще задан (иначе это первый запуск: раздел «Безопасность»).
   fetch("/api/settings")
-    .then((r) => r.json())
+    .then((r) => {
+      if (r.status === 401) {
+        showUnlockPanel(true);
+        return null;
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
     .then((settings) => {
-      applySettings(settings);
-      setTimeout(() => $("setBroker").focus(), 50);
+      if (settings) loaded(settings);
     })
     .catch((error) => showFormErrors([`Не удалось прочитать настройки: ${error}`]));
 }
@@ -1537,7 +1896,7 @@ async function saveSettings() {
   const saveBtn = $("settingsSave");
   saveBtn.disabled = true;
   try {
-    const response = await fetch(endpoint, {
+    const response = await settingsFetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -1764,6 +2123,20 @@ function init() {
   $("settingsSave").addEventListener("click", saveSettings);
   $("setConnection").addEventListener("change", onConnectionChange);
   $("connDelete").addEventListener("click", deleteConnection);
+  $("unlockBtn").addEventListener("click", unlockSettings);
+  $("unlockPassword").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      unlockSettings();
+    }
+  });
+  $("serverSwitch").addEventListener("change", (event) => {
+    const pid = event.target.value;
+    if (!pid || pid === activeConnectionId) return;
+    switchFromHeader(pid);
+  });
+  $("passwordSave").addEventListener("click", saveSettingsPassword);
+  $("passwordClear").addEventListener("click", clearSettingsPassword);
   // Enter в поле настроек не должен перезагружать страницу (неявная
   // отправка формы): сохранение — только кнопкой «Сохранить».
   $("settingsForm").addEventListener("submit", (event) => event.preventDefault());
