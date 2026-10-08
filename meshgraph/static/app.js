@@ -36,6 +36,14 @@ const state = {
   chatSig: null,
   chatMessages: [],
   chatSeenTs: 0,
+  // Превью ссылок: url → результат /api/link_preview, множество запросов
+  // в полёте и таймер пакетного перерисовывания (превью приходят по одному,
+  // пересобирать список на каждый ответ — значит мигать gif-картинками).
+  linkPreviews: new Map(),
+  linkPreviewPending: new Set(),
+  linkPreviewTimer: null,
+  // Открытый лайтбокс: список картинок сообщения и текущий индекс.
+  lightbox: { urls: [], index: 0 },
 };
 
 const AUTO_REFRESH_MS = 60000;
@@ -1034,13 +1042,216 @@ function chatMessageEl(msg) {
   const bubble = chatEl("div", "chat-bubble");
   if (msg.reply_to) bubble.appendChild(chatReplyEl(msg.reply_to));
   if (msg.image) bubble.appendChild(pixelArtEl(msg.image));
-  else bubble.appendChild(chatEl("div", "chat-text", msg.text));
+  else appendChatSegments(bubble, msg);
   if (msg.emoji_only) bubble.classList.add("chat-emoji-only");
   appendChatReactions(bubble, msg.reactions);
 
   main.appendChild(bubble);
   row.appendChild(main);
   return row;
+}
+
+// ---------------------------------------------------------------------------
+// Chat links: previews, image collages, lightbox
+// ---------------------------------------------------------------------------
+
+// Пузырь со ссылками: текст и ссылки идут в исходном порядке, соседние
+// картинки складываются в один коллаж (очередь соседнего текста не меняется).
+function appendChatSegments(bubble, msg) {
+  const segments = meshgraphSplitLinks(msg.text || "");
+  let i = 0;
+  while (i < segments.length) {
+    const segment = segments[i];
+    if (segment.type === "text") {
+      bubble.appendChild(chatEl("div", "chat-text", segment.text));
+      i += 1;
+      continue;
+    }
+    const run = [];
+    let j = i;
+    while (
+      j < segments.length &&
+      segments[j].type === "link" &&
+      meshgraphPreviewKind(segments[j].url) === "image"
+    ) {
+      run.push(segments[j].url);
+      j += 1;
+    }
+    if (run.length) {
+      bubble.appendChild(chatCollageEl(run));
+      i = j;
+      continue;
+    }
+    bubble.appendChild(chatLinkEl(segment.url));
+    i += 1;
+  }
+}
+
+function meshgraphPreviewKind(url) {
+  const preview = state.linkPreviews.get(url);
+  return preview ? preview.kind : "pending";
+}
+
+// Ссылка: до прихода превью — компактный чип с хостом, после — карточка
+// с заголовком и описанием (или картинка — её рисует коллаж выше).
+function chatLinkEl(url) {
+  scheduleLinkPreview(url);
+  const preview = state.linkPreviews.get(url);
+  if (preview && preview.kind === "page") return chatCardEl(url, preview);
+  const chip = chatEl("a", "chat-link-chip");
+  chip.href = url;
+  chip.target = "_blank";
+  chip.rel = "noopener noreferrer";
+  chip.title = url;
+  chip.appendChild(chatEl("span", "chat-link-host", meshgraphLinkHost(url)));
+  chip.appendChild(chatEl("span", "chat-link-ext", "↗"));
+  return chip;
+}
+
+function chatCardEl(url, preview) {
+  const card = chatEl("a", "chat-link-card");
+  card.href = preview.url || url;
+  card.target = "_blank";
+  card.rel = "noopener noreferrer";
+  if (preview.image) {
+    const thumb = document.createElement("img");
+    thumb.className = "chat-link-thumb";
+    thumb.src = preview.image;
+    thumb.loading = "lazy";
+    thumb.decoding = "async";
+    thumb.alt = "";
+    thumb.addEventListener("error", () => thumb.remove());
+    card.appendChild(thumb);
+  }
+  const body = chatEl("div", "chat-link-body");
+  body.appendChild(
+    chatEl("div", "chat-link-title", preview.title || meshgraphLinkHost(url))
+  );
+  if (preview.description) {
+    body.appendChild(chatEl("div", "chat-link-desc", preview.description));
+  }
+  body.appendChild(
+    chatEl("div", "chat-link-site", preview.site || meshgraphLinkHost(url))
+  );
+  card.appendChild(body);
+  return card;
+}
+
+// Коллаж соседних картинок: клетки-квадраты (1 — картинка целиком),
+// по клику — лайтбокс на весь список. Протухшая ссылка (обменники живут
+// недолго) превращается в чип на оригинал, а не в пустую плитку.
+function chatCollageEl(urls) {
+  const grid = meshgraphCollageGrid(urls.length);
+  const wrap = chatEl("div", "chat-collage");
+  wrap.dataset.n = String(grid.shown + (grid.extra ? 1 : 0));
+  urls.slice(0, grid.shown).forEach((url, index) => {
+    const cell = chatEl("button", "chat-collage-cell");
+    cell.type = "button";
+    cell.title = "Показать";
+    const img = document.createElement("img");
+    img.src = url;
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.alt = "Картинка из ссылки";
+    img.addEventListener("error", () => {
+      cell.dataset.broken = "1";
+      cell.classList.add("chat-collage-broken");
+      cell.title = url;
+      img.remove();
+      cell.appendChild(chatEl("span", "", meshgraphLinkHost(url)));
+    });
+    cell.appendChild(img);
+    cell.addEventListener("click", () => {
+      if (cell.dataset.broken === "1") {
+        window.open(url, "_blank", "noopener");
+        return;
+      }
+      openLightbox(urls, index);
+    });
+    wrap.appendChild(cell);
+  });
+  if (grid.extra) {
+    const more = chatEl("button", "chat-collage-more", `+${grid.extra}`);
+    more.type = "button";
+    more.title = "Показать все картинки";
+    more.addEventListener("click", () => openLightbox(urls, grid.shown));
+    wrap.appendChild(more);
+  }
+  return wrap;
+}
+
+// Запрос превью один раз на url; ответы приходят по одному, поэтому
+// перерисовка чата пакуется в один таймер — без мигания картинок.
+function scheduleLinkPreview(url) {
+  if (state.linkPreviews.has(url) || state.linkPreviewPending.has(url)) return;
+  state.linkPreviewPending.add(url);
+  fetch(`/api/link_preview?url=${encodeURIComponent(url)}`)
+    .then((response) => (response.ok ? response.json() : null))
+    .then((data) => {
+      state.linkPreviewPending.delete(url);
+      state.linkPreviews.set(
+        url,
+        data && data.ok ? data.preview : { kind: "error" }
+      );
+      queueChatRerender();
+    })
+    .catch(() => {
+      state.linkPreviewPending.delete(url);
+      state.linkPreviews.set(url, { kind: "error" });
+      queueChatRerender();
+    });
+}
+
+function queueChatRerender() {
+  if (state.linkPreviewTimer) return;
+  state.linkPreviewTimer = setTimeout(() => {
+    state.linkPreviewTimer = null;
+    if (state.chatMessages.length) renderChat(state.chatMessages, true);
+  }, 300);
+}
+
+// ---------------------------------------------------------------------------
+// Lightbox: карусель картинок одного сообщения (gif остаётся анимированным)
+// ---------------------------------------------------------------------------
+
+function openLightbox(urls, index) {
+  state.lightbox = { urls, index };
+  $("lightbox").hidden = false;
+  document.body.classList.add("lightbox-open");
+  updateLightbox();
+}
+
+function updateLightbox() {
+  const { urls, index } = state.lightbox;
+  const url = urls[index];
+  $("lightboxError").hidden = true;
+  $("lightboxImg").hidden = false;
+  $("lightboxImg").src = url;
+  $("lightboxCounter").textContent = `${index + 1} / ${urls.length}`;
+  $("lightboxPrev").hidden = urls.length < 2;
+  $("lightboxNext").hidden = urls.length < 2;
+  $("lightboxSource").href = url;
+  // Соседние кадры грузим заранее — перелистывание не ждёт сети.
+  [index - 1, index + 1].forEach((i) => {
+    if (urls[i]) new Image().src = urls[i];
+  });
+}
+
+function lightboxStep(delta) {
+  const total = state.lightbox.urls.length;
+  if (total < 2) return;
+  state.lightbox.index = (state.lightbox.index + delta + total) % total;
+  updateLightbox();
+}
+
+function closeLightbox() {
+  $("lightbox").hidden = true;
+  document.body.classList.remove("lightbox-open");
+  state.lightbox = { urls: [], index: 0 };
+}
+
+function lightboxIsOpen() {
+  return !$("lightbox").hidden;
 }
 
 function jumpToChatMessage(packetId) {
@@ -1053,9 +1264,11 @@ function jumpToChatMessage(packetId) {
   target.classList.add("chat-flash");
 }
 
-function renderChat(messages) {
+function renderChat(messages, force) {
   const signature = chatSignature(messages);
-  if (signature === state.chatSig) return;  // список прежний — DOM не трогаем
+  // force — превью ссылок изменились: состав сообщений прежний, но картинки
+  // и карточки в пузырях уже другие.
+  if (!force && signature === state.chatSig) return;  // список прежний — DOM не трогаем
   const first = state.chatSig === null;
   state.chatSig = signature;
   state.chatMessages = messages;
@@ -2095,6 +2308,13 @@ function init() {
   });
 
   document.addEventListener("keydown", (event) => {
+    // Лайтбокс поверх всего: Escape его закрывает, стрелки листают.
+    if (lightboxIsOpen()) {
+      if (event.key === "Escape") closeLightbox();
+      else if (event.key === "ArrowLeft") lightboxStep(-1);
+      else if (event.key === "ArrowRight") lightboxStep(1);
+      return;
+    }
     if (event.key === "Escape") {
       if (!$("settingsModal").hidden) closeSettings();
       // Мобильный ящик — тоже оверлей: первый Escape его закрывает…
@@ -2111,6 +2331,37 @@ function init() {
 
   $("clearSelection").addEventListener("click", () => select(null, null));
   $("nodeSearch").addEventListener("input", (e) => runSearch(e.target.value));
+
+  // Лайтбокс: крестик, стрелки, клик по фону, свайп и битая картинка.
+  $("lightboxClose").addEventListener("click", closeLightbox);
+  $("lightboxPrev").addEventListener("click", () => lightboxStep(-1));
+  $("lightboxNext").addEventListener("click", () => lightboxStep(1));
+  $("lightboxStage").addEventListener("click", (event) => {
+    if (event.target === $("lightboxStage")) closeLightbox();
+  });
+  $("lightboxImg").addEventListener("error", () => {
+    $("lightboxImg").hidden = true;
+    $("lightboxError").hidden = false;
+  });
+  let lightboxSwipeX = null;
+  $("lightbox").addEventListener(
+    "touchstart",
+    (event) => {
+      lightboxSwipeX =
+        event.touches.length === 1 ? event.touches[0].clientX : null;
+    },
+    { passive: true }
+  );
+  $("lightbox").addEventListener(
+    "touchend",
+    (event) => {
+      if (lightboxSwipeX === null) return;
+      const dx = event.changedTouches[0].clientX - lightboxSwipeX;
+      lightboxSwipeX = null;
+      if (Math.abs(dx) >= 48) lightboxStep(dx < 0 ? 1 : -1);
+    },
+    { passive: true }
+  );
 
   $("zoomIn").addEventListener("click", () => zoomBy(1.35));
   $("zoomOut").addEventListener("click", () => zoomBy(1 / 1.35));

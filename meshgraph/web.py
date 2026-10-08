@@ -9,7 +9,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from . import __version__, chat, graph, store
+from . import __version__, chat, graph, preview, store
 from .config import (
     GRAPH_MODES,
     Settings,
@@ -130,6 +130,16 @@ def create_app(
             limit=args.get("limit", chat.DEFAULT_LIMIT, type=int),
         )
         return jsonify(payload)
+
+    @app.get("/api/link_preview")
+    def api_link_preview():
+        # Public on purpose: chat is public, and the response only mirrors
+        # metadata that any visitor could fetch from the target host anyway.
+        try:
+            url = preview.validate_url(request.args.get("url", ""))
+        except ValueError as exc:
+            return jsonify({"ok": False, "errors": [str(exc)]}), 400
+        return jsonify({"ok": True, "preview": preview.get_preview(url)})
 
     # ------------------------------------------------------------------
     # Status

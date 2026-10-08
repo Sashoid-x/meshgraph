@@ -783,3 +783,37 @@ def test_status_lists_every_server_for_the_public_switcher(client):
         "enabled", "active", "connected", "error", "messages",
     }
     assert all(c["topic"] for c in connections)
+
+
+# ---------------------------------------------------------------------------
+# Link previews
+# ---------------------------------------------------------------------------
+
+
+def test_link_preview_endpoint_rejects_non_http_urls(client):
+    response = client.get(
+        "/api/link_preview", query_string={"url": "file:///etc/passwd"}
+    )
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["ok"] is False
+    assert payload["errors"]
+
+
+def test_link_preview_endpoint_is_public_and_wraps_the_result(client, monkeypatch):
+    # Чат открыт всем, значит и превью без пароля; сами запросы наружу
+    # подменяются — тест ходить в сеть не должен.
+    monkeypatch.setattr(
+        web.preview,
+        "get_preview",
+        lambda url: {"kind": "page", "url": url, "title": "T",
+                     "description": "", "image": "", "site": "a.example"},
+    )
+    response = client.get(
+        "/api/link_preview", query_string={"url": "https://a.example/x"}
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["preview"]["kind"] == "page"
+    assert payload["preview"]["url"] == "https://a.example/x"

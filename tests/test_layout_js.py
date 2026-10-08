@@ -574,3 +574,72 @@ def test_seed_positions_reseeds_when_the_previous_one_is_broken(js):
     # i = 0 → угол 0: x = 400 + 180 ± 30, y = 300 ± 30.
     assert 550 <= result["x"] <= 610
     assert 270 <= result["y"] <= 330
+
+
+# ---------------------------------------------------------------------------
+# Chat link helpers (meshgraph/static/chatlinks.js)
+# ---------------------------------------------------------------------------
+
+CHATLINKS_JS = ROOT / "meshgraph" / "static" / "chatlinks.js"
+
+
+@pytest.fixture(scope="module")
+def links_js() -> "quickjs.Context":
+    ctx = quickjs.Context()
+    ctx.eval(CHATLINKS_JS.read_text(encoding="utf-8"))
+    return ctx
+
+
+def test_split_links_preserves_text_and_link_order(links_js):
+    result = run(
+        links_js,
+        "meshgraphSplitLinks("
+        "'до ссылки https://a.example/x.jpg после\\nи ещё https://b.example/')",
+    )
+    assert result == [
+        {"type": "text", "text": "до ссылки "},
+        {"type": "link", "url": "https://a.example/x.jpg"},
+        {"type": "text", "text": " после\nи ещё "},
+        {"type": "link", "url": "https://b.example/"},
+    ]
+
+
+def test_split_links_keeps_plain_text_as_one_segment(links_js):
+    assert run(links_js, "meshgraphSplitLinks('просто текст')") == [
+        {"type": "text", "text": "просто текст"}
+    ]
+    assert run(links_js, "meshgraphSplitLinks('')") == []
+    assert run(links_js, "meshgraphSplitLinks(null)") == []
+
+
+def test_split_links_trims_sentence_punctuation(links_js):
+    # Точка после ссылки — часть предложения, не адреса.
+    result = run(links_js, "meshgraphSplitLinks('смотри https://a.example/x. конец')")
+    assert result[1]["url"] == "https://a.example/x"
+    assert result[2]["text"] == ". конец"
+
+
+def test_split_links_keeps_brackets_the_url_needs(links_js):
+    # Закрывающая скобка висит после ссылки — её срезаем…
+    wrapped = run(
+        links_js, "meshgraphSplitLinks('см. (https://a.example/page) и дальше')"
+    )
+    assert wrapped[1]["url"] == "https://a.example/page"
+    assert wrapped[2]["text"] == ") и дальше"
+    # …а скобка, открывающаяся внутри адреса, остаётся его частью.
+    balanced = run(links_js, "meshgraphSplitLinks('https://a.example/f(a)')")
+    assert balanced == [{"type": "link", "url": "https://a.example/f(a)"}]
+
+
+def test_collage_grid_adapts_to_the_image_count(links_js):
+    assert run(links_js, "meshgraphCollageGrid(1)") == {"shown": 1, "extra": 0}
+    assert run(links_js, "meshgraphCollageGrid(4)") == {"shown": 4, "extra": 0}
+    assert run(links_js, "meshgraphCollageGrid(6)") == {"shown": 6, "extra": 0}
+    # Больше шести — пять плиток и «+N», все картинки открываются в лайтбоксе.
+    assert run(links_js, "meshgraphCollageGrid(7)") == {"shown": 5, "extra": 2}
+    assert run(links_js, "meshgraphCollageGrid(12)") == {"shown": 5, "extra": 7}
+
+
+def test_link_host_is_taken_without_path_or_scheme(links_js):
+    assert run(links_js, "meshgraphLinkHost('https://meshpic.org/w6i')") == "meshpic.org"
+    assert run(links_js, "meshgraphLinkHost('http://192.168.1.5:8080/a')") == "192.168.1.5"

@@ -406,6 +406,28 @@
   </div>
 </div>
 
+<!-- Просмотр картинок по ссылкам: карусель на весь экран (gif остаётся
+     анимированным — это обычный <img> с оригинальным адресом). -->
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lightbox-close" id="lightboxClose" type="button"
+          aria-label="Закрыть просмотр">✕</button>
+  <button class="lightbox-nav" id="lightboxPrev" type="button"
+          aria-label="Предыдущее изображение">‹</button>
+  <div class="lightbox-stage" id="lightboxStage">
+    <img id="lightboxImg" alt="Просмотр изображения">
+    <div class="lightbox-error" id="lightboxError" hidden>
+      Не удалось загрузить изображение
+    </div>
+  </div>
+  <button class="lightbox-nav lightbox-next" id="lightboxNext" type="button"
+          aria-label="Следующее изображение">›</button>
+  <div class="lightbox-hud">
+    <span class="lightbox-counter" id="lightboxCounter"></span>
+    <a class="lightbox-source" id="lightboxSource" target="_blank"
+       rel="noopener noreferrer">открыть оригинал ↗</a>
+  </div>
+</div>
+
 <script>
   /* Состояние боковой панели до первой отрисовки — без вспышки: на узких
      экранах ящик закрыт всегда, на десктопе — по сохранённому выбору.
@@ -426,6 +448,7 @@
 <script src="{{ url_for('static', filename='d3.v7.min.js') }}"></script>
 <script src="{{ url_for('static', filename='layout.js') }}"></script>
 <script src="{{ url_for('static', filename='pixelart.js') }}"></script>
+<script src="{{ url_for('static', filename='chatlinks.js') }}"></script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
