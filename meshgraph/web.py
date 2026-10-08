@@ -99,6 +99,12 @@ def create_app(
         payload = worker.status()
         payload["version"] = __version__
         payload["settings_file"] = str(store_ref.path)
+        current = store_ref.get()
+        payload["connection"] = {
+            "id": current.active_connection,
+            "name": current.connection_name,
+            "db_file": current.db_file,
+        }
         return jsonify(payload)
 
     # ------------------------------------------------------------------
@@ -136,6 +142,10 @@ def create_app(
             return jsonify({"ok": False, "errors": [str(exc)]}), 500
 
         graph.invalidate_cache()
+        # A split (new broker typed into the dialog) created a new profile
+        # with a brand-new database file: make sure its schema exists before
+        # the UI asks for a graph, without waiting for the worker's reconnect.
+        store.ensure_ready(updated)
         return jsonify(
             {
                 "ok": True,
@@ -153,6 +163,47 @@ def create_app(
                 setattr(candidate, key, value)
         errors = validate(candidate)
         return jsonify({"ok": not errors, "errors": errors})
+
+    # ------------------------------------------------------------------
+    # Connections (one server — one database file)
+    # ------------------------------------------------------------------
+
+    @app.post("/api/connections")
+    def api_connections_create():
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "errors": ["Expected a JSON object."]}), 400
+        try:
+            created = store_ref.add_connection(**body)
+        except ValueError as exc:
+            return jsonify({"ok": False, "errors": str(exc).split("; ")}), 400
+        store.ensure_ready(created)
+        graph.invalidate_cache()
+        return jsonify({"ok": True, "settings": created.masked()})
+
+    @app.post("/api/connections/select")
+    def api_connections_select():
+        body = request.get_json(silent=True) or {}
+        pid = body.get("id") if isinstance(body, dict) else None
+        if not pid:
+            return jsonify({"ok": False, "errors": ["Connection id is required."]}), 400
+        try:
+            selected = store_ref.select_connection(str(pid))
+        except ValueError as exc:
+            return jsonify({"ok": False, "errors": str(exc).split("; ")}), 400
+        store.ensure_ready(selected)
+        graph.invalidate_cache()
+        return jsonify({"ok": True, "settings": selected.masked()})
+
+    @app.delete("/api/connections/<pid>")
+    def api_connections_delete(pid: str):
+        try:
+            remaining = store_ref.remove_connection(pid)
+        except ValueError as exc:
+            return jsonify({"ok": False, "errors": str(exc).split("; ")}), 400
+        # The database file stays on disk on purpose (see remove_connection).
+        graph.invalidate_cache()
+        return jsonify({"ok": True, "settings": remaining.masked()})
 
     @app.errorhandler(404)
     def not_found(_error):

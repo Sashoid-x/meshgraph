@@ -155,6 +155,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .btn-primary { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
 .btn-primary:hover { background: var(--accent); border-color: var(--accent); }
 .btn-ghost { background: transparent; }
+.btn-danger { color: var(--err); border-color: var(--err); }
+.btn-danger:hover:not(:disabled) { background: transparent; border-color: var(--err); }
 .btn-block { width: 100%; }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 .btn:disabled { opacity: .55; cursor: default; }

@@ -157,6 +157,7 @@
         <div><dt>Пакетов</dt><dd id="stPackets">—</dd></div>
         <div><dt>Через реле</dt><dd id="stRelayed">—</dd></div>
         <div><dt>Обновлено</dt><dd id="stUpdated">—</dd></div>
+        <div><dt>Подключение</dt><dd id="stConnection">—</dd></div>
       </dl>
       <div class="hint" id="stTruncated" hidden></div>
     </section>
@@ -233,6 +234,25 @@
     </div>
 
     <form id="settingsForm" class="modal-body">
+      <fieldset>
+        <legend>Подключение</legend>
+        <div class="grid2">
+          <div class="field">
+            <label for="setConnection">Профиль</label>
+            <select id="setConnection" name="connection_select"></select>
+            <div class="hint">У каждого подключения свой сервер и своя база данных — данные разных серверов не смешиваются.</div>
+          </div>
+          <div class="field">
+            <label for="setConnName">Название</label>
+            <input id="setConnName" name="connection_name" type="text"
+                   placeholder="как подключение показывается в интерфейсе">
+          </div>
+        </div>
+        <div class="hint" id="connDbHint">Файл базы данных: <code id="connDbFile">—</code>.
+          При удалении подключения файл остаётся на диске — ничего не теряется.</div>
+        <button class="btn btn-ghost btn-danger" id="connDelete" type="button">Удалить подключение</button>
+      </fieldset>
+
       <fieldset>
         <legend>MQTT-брокер</legend>
 

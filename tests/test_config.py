@@ -6,6 +6,7 @@ import base64
 import logging
 
 import pytest
+import yaml
 
 from meshgraph.config import Settings, SettingsStore, validate
 
@@ -180,3 +181,239 @@ def test_topic_and_keys_helpers():
     s = Settings(mqtt_topic_prefix="msh", decryption_keys="a, b ,,c")
     assert s.subscribe_topic == "msh/+/+/+/#"
     assert s.keys == ["a", "b", "c"]
+
+
+# ---------------------------------------------------------------------------
+# Connection profiles: one server — one database file
+# ---------------------------------------------------------------------------
+
+def _profile_ids(settings: Settings) -> list[str]:
+    return [str(p["id"]) for p in settings.connections]
+
+
+def test_legacy_flat_config_becomes_the_first_profile(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "mqtt_broker_address: mqtt.old.example\n"
+        "mqtt_port: 8883\n"
+        "mqtt_topic_prefix: msh\n"
+        "mqtt_topic_suffix: /RU/SAR/#\n"
+        "db_file: data/legacy.db\n",
+        encoding="utf-8",
+    )
+    settings = SettingsStore(path=path).get()
+    assert len(settings.connections) == 1
+    profile = settings.connections[0]
+    assert settings.active_connection == profile["id"]
+    # The existing database stays where it is — no data moves.
+    assert profile["db_file"] == "data/legacy.db"
+    assert settings.db_file == "data/legacy.db"
+    assert settings.connection_name == profile["name"]
+
+
+def test_credential_edit_keeps_profile_and_database(settings_store):
+    settings_store.update(mqtt_username="alice", mqtt_password="pw")
+    settings = settings_store.get()
+    assert len(settings.connections) == 1
+    assert settings.db_file == "data/graph.db"
+    assert settings.connections[0]["mqtt_username"] == "alice"
+
+
+def test_broker_change_spawns_a_new_connection_and_database(settings_store):
+    settings_store.update(mqtt_broker_address="mqtt.other.example")
+    settings = settings_store.get()
+    assert len(settings.connections) == 2
+    old = next(
+        p for p in settings.connections if p["id"] != settings.active_connection
+    )
+    # The old profile keeps its file and stays fully intact.
+    assert old["db_file"] == "data/graph.db"
+    # The new one gets a file of its own next to it, named after the server.
+    assert settings.db_file == "data/mqtt-other-example-msh.db"
+    assert settings.db_file != old["db_file"]
+
+
+def test_returning_to_the_old_server_reactivates_its_profile(settings_store):
+    settings_store.update(mqtt_username="alice")
+    settings_store.update(mqtt_broker_address="mqtt.other.example")
+    settings_store.update(mqtt_broker_address="127.0.0.1")
+    settings = settings_store.get()
+    assert len(settings.connections) == 2  # no twins for servers seen before
+    assert settings.db_file == "data/graph.db"
+    assert settings.mqtt_username == "alice"  # its own credentials come back
+
+
+def test_topic_prefix_change_also_splits(settings_store):
+    settings_store.update(mqtt_topic_prefix="othernet")
+    settings = settings_store.get()
+    assert len(settings.connections) == 2
+    assert settings.db_file == "data/127-0-0-1-othernet.db"
+
+
+def test_port_change_splits_too(settings_store):
+    settings_store.update(mqtt_port=8883, mqtt_tls=True)
+    settings = settings_store.get()
+    assert len(settings.connections) == 2
+    # Same broker+topic → the id base collides → a suffix keeps it unique.
+    assert settings.db_file == "data/127-0-0-1-msh-2.db"
+    assert settings.mqtt_tls is True
+
+
+def test_add_connection_creates_and_activates(settings_store):
+    settings_store.add_connection(
+        mqtt_broker_address="mesh.example", mqtt_topic_prefix="mesh"
+    )
+    settings = settings_store.get()
+    assert settings.active_connection == "mesh-example-mesh"
+    assert settings.db_file == "data/mesh-example-mesh.db"
+    assert settings.connection_name == "mesh.example:1883 (mesh)"
+    assert len(settings.connections) == 2
+
+
+def test_add_connection_inherits_untouched_fields(settings_store):
+    settings_store.update(mqtt_username="alice", decryption_keys="AQ==")
+    settings_store.add_connection(mqtt_broker_address="mesh.example")
+    settings = settings_store.get()
+    assert settings.mqtt_username == "alice"  # credentials travel along
+    assert settings.connections[0]["mqtt_username"] == "alice"  # old stays too
+
+
+def test_add_connection_reuses_profile_with_same_identity(settings_store):
+    settings_store.add_connection(mqtt_broker_address="mesh.example")
+    settings = settings_store.add_connection(mqtt_broker_address="mesh.example")
+    # Default profile + mesh.example: one server must not gain a twin.
+    assert len(settings.connections) == 2
+    assert settings.active_connection == "mesh-example-msh"
+
+
+def test_add_connection_rejects_unknown_fields(settings_store):
+    with pytest.raises(ValueError, match="Unknown connection fields"):
+        settings_store.add_connection(broker_typo="x")
+
+
+def test_select_connection_swaps_the_flat_fields(settings_store):
+    settings_store.add_connection(
+        mqtt_broker_address="mesh.example", mqtt_username="bob"
+    )
+    settings = settings_store.select_connection("127-0-0-1-msh")
+    assert settings.mqtt_broker_address == "127.0.0.1"
+    assert settings.db_file == "data/graph.db"
+    assert settings.connection_name.startswith("127.0.0.1:1883")
+    with pytest.raises(ValueError, match="Unknown connection"):
+        settings_store.select_connection("nope")
+
+
+def test_remove_connection_falls_back_and_keeps_the_file(settings_store, tmp_path):
+    settings_store.update(db_file=str(tmp_path / "main.db"))
+    created = settings_store.add_connection(mqtt_broker_address="mesh.example")
+    db_path = tmp_path / "mesh-example-msh.db"
+    assert created.db_file == str(db_path)
+    db_path.write_bytes(b"not to be deleted")
+
+    settings = settings_store.remove_connection(created.active_connection)
+    assert len(settings.connections) == 1
+    assert settings.active_connection == "127-0-0-1-msh"
+    assert settings.db_file == str(tmp_path / "main.db")
+    # Deleting a connection never destroys data.
+    assert db_path.exists()
+
+
+def test_remove_last_connection_is_refused(settings_store):
+    active = settings_store.get().active_connection
+    with pytest.raises(ValueError, match="last connection"):
+        settings_store.remove_connection(active)
+
+
+def test_masked_hides_every_profile_secret(settings_store):
+    settings_store.add_connection(
+        mqtt_broker_address="mesh.example", mqtt_password="s3cret"
+    )
+    masked = settings_store.get().masked()
+    assert masked["connections"]
+    for profile in masked["connections"]:
+        assert "mqtt_password" not in profile
+        assert "decryption_keys" not in profile
+    # The active password keeps arriving in its usual masked form.
+    assert masked["mqtt_password"] == "••••••••"
+    assert "s3cret" not in str(masked["connections"])
+
+
+def test_registry_survives_saves_and_reloads(settings_store):
+    settings_store.update(mqtt_broker_address="a.example")
+    settings_store.update(mqtt_username="bob")  # in-place on the new profile
+    first = settings_store.get()
+    reloaded = SettingsStore(path=settings_store.path).get()
+    assert _profile_ids(reloaded) == _profile_ids(first)
+    assert reloaded.active_connection == first.active_connection
+    assert reloaded.db_file == first.db_file
+    assert reloaded.mqtt_username == "bob"
+
+
+def test_rename_updates_the_active_profile(settings_store):
+    settings_store.update(connection_name="Мой сервер")
+    settings = settings_store.get()
+    assert settings.connection_name == "Мой сервер"
+    assert settings.connections[0]["name"] == "Мой сервер"
+    reloaded = SettingsStore(path=settings_store.path).get()
+    assert reloaded.connection_name == "Мой сервер"
+
+
+def test_hand_edited_broker_in_yaml_follows_the_new_server_rule(tmp_path):
+    path = tmp_path / "config.yaml"
+    store = SettingsStore(path=path)
+    store.update(mqtt_username="alice")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["mqtt_broker_address"] = "hand.example"
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    settings = SettingsStore(path=path).get()
+    # The registry wins on the credentials, the flat identity spawns a new
+    # connection with a database of its own.
+    assert len(settings.connections) == 2
+    assert settings.mqtt_broker_address == "hand.example"
+    assert settings.mqtt_username == "alice"
+    assert settings.db_file == "data/hand-example-msh.db"
+
+
+def test_validate_rejects_shared_database_file():
+    settings = Settings()
+    settings.connections = [
+        {
+            "id": "a", "name": "A",
+            "mqtt_broker_address": "a.example", "mqtt_port": 1883,
+            "mqtt_topic_prefix": "msh", "db_file": "data/same.db",
+        },
+        {
+            "id": "b", "name": "B",
+            "mqtt_broker_address": "b.example", "mqtt_port": 1883,
+            "mqtt_topic_prefix": "msh", "db_file": "data/same.db",
+        },
+    ]
+    settings.active_connection = "a"
+    errors = validate(settings)
+    assert any("share the database file" in e for e in errors)
+
+
+def test_validate_rejects_unknown_active_connection():
+    settings = Settings()
+    settings.connections = [
+        {
+            "id": "a", "name": "A",
+            "mqtt_broker_address": "a.example", "mqtt_port": 1883,
+            "mqtt_topic_prefix": "msh", "db_file": "data/a.db",
+        },
+    ]
+    settings.active_connection = "ghost"
+    errors = validate(settings)
+    assert any("not in the list" in e for e in errors)
+
+
+def test_validate_rejects_profile_without_broker():
+    settings = Settings()
+    settings.connections = [
+        {"id": "a", "name": "A", "mqtt_broker_address": "  ",
+         "mqtt_port": 1883, "db_file": "data/a.db"},
+    ]
+    settings.active_connection = "a"
+    errors = validate(settings)
+    assert any("needs a broker address" in e for e in errors)

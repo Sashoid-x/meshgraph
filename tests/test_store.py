@@ -372,3 +372,24 @@ def test_counters_track_dedup_and_prune(settings):
     after = store.counters()
     assert after["packets_deduplicated"] == before["packets_deduplicated"] + 1
     assert after["packets_pruned_total"] == before["packets_pruned_total"] + 1
+
+
+def test_counters_reset_when_the_database_changes(settings, tmp_path):
+    """Switching connections must not carry another server's counters over."""
+    packet = make_packet(from_node_id=7, gateway_node_id=8, mesh_packet_id=42)
+    assert store.insert_packet(settings.db_file, packet) is True
+    assert store.insert_packet(settings.db_file, packet) is False  # duplicate
+    assert store.counters()["packets_deduplicated"] >= 1
+
+    # Another database comes on screen → the totals describe it, not the old one.
+    store.init(str(tmp_path / "other-server.db"))
+    assert store.counters()["packets_deduplicated"] == 0
+    assert store.counters()["packets_pruned_total"] == 0
+
+    # Re-opening the very same file is not a switch: the totals stand.
+    other = str(tmp_path / "other-server.db")
+    store.insert_packet(other, packet)
+    store.insert_packet(other, packet)  # +1 duplicate
+    assert store.counters()["packets_deduplicated"] == 1
+    store.init(other)
+    assert store.counters()["packets_deduplicated"] == 1

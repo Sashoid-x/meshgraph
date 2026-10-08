@@ -177,6 +177,11 @@ def init(db_file: str) -> None:
             conn.close()
         if _initialized_for != db_file:
             _initialized_for = db_file
+            # Process-lifetime counters feed /api/graph stats: after a
+            # connection switch they must describe the database now on
+            # screen, not the one we came from.
+            _counters["packets_deduplicated"] = 0
+            _counters["packets_pruned_total"] = 0
             logger.info("Database ready: %s", db_file)
 
 

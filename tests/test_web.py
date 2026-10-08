@@ -431,3 +431,144 @@ def test_page_wires_the_truncation_hint(client):
     html = (root / "templates" / "index.html").read_text(encoding="utf-8")
     assert "stTruncated" in app_js  # предупреждение выводится из stats
     assert 'id="stTruncated"' in html  # и для него есть элемент
+
+
+# ---------------------------------------------------------------------------
+# Connections (one server — one database)
+# ---------------------------------------------------------------------------
+
+def test_page_wires_the_connection_selector(client):
+    body = client.get("/").get_data(as_text=True)
+    assert 'id="setConnection"' in body
+    assert 'id="connDelete"' in body
+    assert 'id="connDbFile"' in body
+    assert 'id="stConnection"' in body
+    app_js = (Path(web.PACKAGE_DIR) / "static" / "app.js").read_text(encoding="utf-8")
+    assert "/api/connections/select" in app_js
+    assert "Новое подключение" in app_js
+    assert "CONNECTION_FIELDS" in app_js
+
+
+def test_status_reports_the_active_connection(client):
+    payload = client.get("/api/status").get_json()
+    assert payload["connection"]["id"]
+    assert payload["connection"]["name"]
+    assert payload["connection"]["db_file"].endswith("web.db")
+
+
+def test_settings_lists_every_connection(client):
+    payload = client.get("/api/settings").get_json()
+    assert payload["connections"]
+    assert payload["active_connection"] == payload["connections"][0]["id"]
+    # The index is just an index: no secrets of any profile.
+    for profile in payload["connections"]:
+        assert set(profile) == {"id", "name", "broker", "port", "db_file"}
+
+
+def test_create_connection_switches_to_its_own_empty_graph(client):
+    response = client.post(
+        "/api/connections",
+        json={"mqtt_broker_address": "mesh.example", "mqtt_topic_prefix": "mesh"},
+    )
+    body = response.get_json()
+    assert response.status_code == 200 and body["ok"]
+    settings = body["settings"]
+    assert settings["active_connection"] == "mesh-example-mesh"
+    assert settings["db_file"].endswith("mesh-example-mesh.db")
+
+    # The other server's packets must not leak into the new database.
+    graph = client.get("/api/graph?mode=combined").get_json()
+    assert graph["nodes"] == []
+    assert graph["stats"]["nodes"] == 0
+    assert client.get("/api/channels").get_json()["channels"] == []
+
+
+def test_select_connection_restores_the_old_data(client):
+    created = client.post(
+        "/api/connections", json={"mqtt_broker_address": "mesh.example"}
+    ).get_json()
+    assert client.get("/api/graph?mode=combined").get_json()["nodes"] == []
+
+    listed = client.get("/api/settings").get_json()
+    original = next(
+        p for p in listed["connections"] if p["id"] != listed["active_connection"]
+    )
+    response = client.post("/api/connections/select", json={"id": original["id"]})
+    assert response.status_code == 200
+    settings = response.get_json()["settings"]
+    assert settings["active_connection"] == original["id"]
+    assert settings["db_file"] == original["db_file"]
+    # Seeded data of the first server is back on screen.
+    assert client.get("/api/graph?mode=combined").get_json()["nodes"]
+
+
+def test_select_unknown_connection_is_a_400(client):
+    response = client.post("/api/connections/select", json={"id": "nope"})
+    assert response.status_code == 400
+    assert any("Unknown connection" in e for e in response.get_json()["errors"])
+
+
+def test_select_requires_an_id(client):
+    response = client.post("/api/connections/select", json={})
+    assert response.status_code == 400
+
+
+def test_delete_falls_back_to_the_next_connection_and_keeps_the_file(client):
+    created = client.post(
+        "/api/connections", json={"mqtt_broker_address": "mesh.example"}
+    ).get_json()
+    active = created["settings"]["active_connection"]
+    db_file = Path(created["settings"]["db_file"])
+    assert db_file.exists()  # the endpoint initialised it
+
+    response = client.delete(f"/api/connections/{active}")
+    body = response.get_json()
+    assert response.status_code == 200 and body["ok"]
+    assert body["settings"]["active_connection"] != active
+    assert len(body["settings"]["connections"]) == 1
+    # Data survives a connection removal — the file stays on disk.
+    assert db_file.exists()
+
+
+def test_delete_last_connection_is_refused(client):
+    active = client.get("/api/settings").get_json()["active_connection"]
+    response = client.delete(f"/api/connections/{active}")
+    assert response.status_code == 400
+    assert any("last connection" in e for e in response.get_json()["errors"])
+
+
+def test_delete_unknown_connection_is_a_400(client):
+    response = client.delete("/api/connections/ghost")
+    assert response.status_code == 400
+
+
+def test_settings_broker_change_creates_a_second_profile(client):
+    response = client.post("/api/settings", json={"mqtt_broker_address": "split.example"})
+    settings = response.get_json()["settings"]
+    assert len(settings["connections"]) == 2
+    assert settings["active_connection"] != settings["connections"][0]["id"]
+    # The old connection is untouched, its database file unchanged.
+    assert settings["connections"][0]["db_file"].endswith("web.db")
+
+
+def test_create_connection_rejects_unknown_field(client):
+    response = client.post("/api/connections", json={"broker_typo": "x"})
+    assert response.status_code == 400
+    assert any("Unknown connection fields" in e for e in response.get_json()["errors"])
+
+
+def test_create_connection_rejects_non_object(client):
+    response = client.post("/api/connections", json=["nope"])
+    assert response.status_code == 400
+
+
+def test_settings_mask_other_profile_passwords(client):
+    client.post(
+        "/api/connections",
+        json={"mqtt_broker_address": "mesh.example", "mqtt_password": "s3cret"},
+    )
+    payload = client.get("/api/settings").get_json()
+    assert payload["mqtt_password"] == "••••••••"
+    for profile in payload["connections"]:
+        assert "mqtt_password" not in profile
+    assert "s3cret" not in str(payload["connections"])

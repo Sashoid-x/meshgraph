@@ -1206,6 +1206,13 @@ async function pollStatus() {
       ? `подключено к ${status.broker}`
       : `нет связи: ${status.broker}`;
 
+    const conn = status.connection;
+    const connCell = $("stConnection");
+    if (conn && connCell) {
+      connCell.textContent = conn.name || conn.id || "—";
+      connCell.title = conn.db_file || "";
+    }
+
     const stats = status.stats || {};
     const packets = stats.messages || 0;
     const dbPackets = (status.db && status.db.packets) || 0;
@@ -1259,6 +1266,7 @@ async function loadChannels() {
 // ---------------------------------------------------------------------------
 
 const SETTINGS_FIELDS = [
+  "connection_name",
   "mqtt_broker_address", "mqtt_port", "mqtt_username", "mqtt_password",
   "mqtt_topic_prefix", "mqtt_topic_suffix", "mqtt_client_id",
   "mqtt_tls", "mqtt_tls_insecure",
@@ -1268,7 +1276,17 @@ const SETTINGS_FIELDS = [
 
 const BOOLEAN_FIELDS = new Set(["mqtt_tls", "mqtt_tls_insecure"]);
 
+// Поля, уезжающие на сервер вместе с новым подключением. Держать в синхроне
+// с PROFILE_FIELDS в meshgraph/config.py: глобальные настройки (период,
+// хранение, лимиты) при создании подключения не отправляются.
+const CONNECTION_FIELDS = new Set([
+  "mqtt_broker_address", "mqtt_port", "mqtt_username", "mqtt_password",
+  "mqtt_topic_prefix", "mqtt_topic_suffix", "mqtt_client_id",
+  "mqtt_tls", "mqtt_tls_insecure", "decryption_keys", "connection_name",
+]);
+
 const FIELD_TO_INPUT = {
+  connection_name: "setConnName",
   mqtt_broker_address: "setBroker",
   mqtt_port: "setPort",
   mqtt_username: "setUser",
@@ -1301,6 +1319,175 @@ function updateTopicPreview() {
   warn.classList.toggle("bad", Boolean(message));
 }
 
+// Активное подключение, режим «новое подключение» и последний ответ
+// /api/settings — модалка живёт между открытиями, состояние восстанавливается
+// при каждом открытии (applySettings).
+let activeConnectionId = "";
+let newConnectionMode = false;
+let lastSettings = null;
+
+function applySettings(settings) {
+  lastSettings = settings;
+  activeConnectionId = settings.active_connection || "";
+  newConnectionMode = false;
+  SETTINGS_FIELDS.forEach((field) => {
+    const input = $(FIELD_TO_INPUT[field]);
+    if (!input) return;
+    let value = settings[field];
+    if (field === "mqtt_password") {
+      value = value || "";
+      input.placeholder = settings.mqtt_password_set
+        ? "пароль задан — введите новый, чтобы изменить"
+        : "необязательно";
+    }
+    if (BOOLEAN_FIELDS.has(field)) {
+      input.checked = Boolean(value);
+      return;
+    }
+    input.value = value === null || value === undefined ? "" : value;
+  });
+  populateConnectionSelect(settings);
+  updateTopicPreview();
+}
+
+function populateConnectionSelect(settings) {
+  const select = $("setConnection");
+  if (!select) return;
+  select.innerHTML = "";
+  (settings.connections || []).forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.name || `${profile.broker}:${profile.port}`;
+    select.appendChild(option);
+  });
+  const create = document.createElement("option");
+  create.value = "__new__";
+  create.textContent = "+ Новое подключение…";
+  select.appendChild(create);
+  const wanted = newConnectionMode ? "__new__" : activeConnectionId;
+  select.value = wanted;
+  if (select.value !== wanted && settings.active_connection) {
+    select.value = settings.active_connection;
+  }
+  updateConnectionDbHint(settings);
+}
+
+function updateConnectionDbHint(settings) {
+  const file = $("connDbFile");
+  if (file) {
+    file.textContent = newConnectionMode
+      ? "новая база будет создана после сохранения"
+      : settings.db_file || "—";
+  }
+  const del = $("connDelete");
+  if (del) del.disabled = (settings.connections || []).length <= 1;
+}
+
+function enterNewConnectionMode() {
+  newConnectionMode = true;
+  // Чистый лист для нового сервера: поля подключения обнуляются, ключи
+  // каналов остаются (частый случай — та же сеть на другом брокере).
+  $("setBroker").value = "";
+  $("setPort").value = "1883";
+  $("setUser").value = "";
+  $("setPass").value = "";
+  $("setPass").placeholder = "необязательно";
+  $("setPrefix").value = "msh";
+  $("setSuffix").value = "/+/+/+/#";
+  $("setClientId").value = "";
+  $("setTls").checked = false;
+  $("setTlsInsecure").checked = false;
+  $("setConnName").value = "";
+  const file = $("connDbFile");
+  if (file) file.textContent = "новая база будет создана после сохранения";
+  const del = $("connDelete");
+  if (del) del.disabled = true;
+  showFormErrors([]);
+  $("settingsHint").textContent =
+    "Новое подключение: укажите сервер и сохраните — ему будет создана своя база данных.";
+  updateTopicPreview();
+  setTimeout(() => $("setBroker").focus(), 50);
+}
+
+async function switchConnection(pid) {
+  const saveBtn = $("settingsSave");
+  saveBtn.disabled = true;
+  try {
+    const response = await fetch("/api/connections/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: pid }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      showFormErrors(result.errors || [`Ошибка HTTP ${response.status}`]);
+      // Переключение не вышло — вернуть селектор к серверному состоянию.
+      fetch("/api/settings").then((r) => r.json()).then(applySettings).catch(() => {});
+      return;
+    }
+    showFormErrors([]);
+    applySettings(result.settings);
+    $("settingsHint").textContent =
+      `Подключено: ${result.settings.connection_name}. Граф, каналы и чат читаются из базы этого подключения.`;
+    reloadGraphData();
+  } catch (error) {
+    showFormErrors([String(error)]);
+  } finally {
+    saveBtn.disabled = false;
+  }
+}
+
+async function onConnectionChange() {
+  const select = $("setConnection");
+  if (select.value === "__new__") {
+    enterNewConnectionMode();
+    return;
+  }
+  if (!select.value || select.value === activeConnectionId) return;
+  await switchConnection(select.value);
+}
+
+async function deleteConnection() {
+  if (!activeConnectionId || !lastSettings) return;
+  const profile = (lastSettings.connections || []).find(
+    (p) => p.id === activeConnectionId
+  );
+  const label = (profile && profile.name) || activeConnectionId;
+  const dbFile = (profile && profile.db_file) || lastSettings.db_file;
+  const confirmed = window.confirm(
+    `Удалить подключение «${label}»?\n\n` +
+    `Если оно активное — переключимся на следующее подключение.\n` +
+    `Файл базы данных ${dbFile} останется на диске: данные не удалятся.`
+  );
+  if (!confirmed) return;
+  try {
+    const response = await fetch(
+      `/api/connections/${encodeURIComponent(activeConnectionId)}`,
+      { method: "DELETE" }
+    );
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      showFormErrors(result.errors || [`Ошибка HTTP ${response.status}`]);
+      return;
+    }
+    showFormErrors([]);
+    applySettings(result.settings);
+    $("settingsHint").textContent =
+      "Подключение удалено, файл базы сохранён. Смотрим оставшееся.";
+    reloadGraphData();
+  } catch (error) {
+    showFormErrors([String(error)]);
+  }
+}
+
+function reloadGraphData() {
+  // Всё, что читается из базы активного подключения, надо обновить целиком.
+  pollStatus();
+  loadChannels();
+  loadGraph();
+  loadChat();
+}
+
 function openSettings() {
   $("settingsModal").hidden = false;
   $("formErrors").hidden = true;
@@ -1308,23 +1495,7 @@ function openSettings() {
   fetch("/api/settings")
     .then((r) => r.json())
     .then((settings) => {
-      SETTINGS_FIELDS.forEach((field) => {
-        const input = $(FIELD_TO_INPUT[field]);
-        if (!input) return;
-        let value = settings[field];
-        if (field === "mqtt_password") {
-          value = value || "";
-          input.placeholder = settings.mqtt_password_set
-            ? "пароль задан — введите новый, чтобы изменить"
-            : "необязательно";
-        }
-        if (BOOLEAN_FIELDS.has(field)) {
-          input.checked = Boolean(value);
-          return;
-        }
-        input.value = value === null || value === undefined ? "" : value;
-      });
-      updateTopicPreview();
+      applySettings(settings);
       setTimeout(() => $("setBroker").focus(), 50);
     })
     .catch((error) => showFormErrors([`Не удалось прочитать настройки: ${error}`]));
@@ -1361,13 +1532,23 @@ async function saveSettings() {
     payload[field] = value;
   });
 
+  // В режиме «новое подключение» на сервер уезжают только поля профиля:
+  // глобальные настройки отправляются обычным сохранением настроек.
+  const wasNew = newConnectionMode;
+  const body = wasNew
+    ? Object.fromEntries(
+        Object.entries(payload).filter(([key]) => CONNECTION_FIELDS.has(key))
+      )
+    : payload;
+  const endpoint = wasNew ? "/api/connections" : "/api/settings";
+
   const saveBtn = $("settingsSave");
   saveBtn.disabled = true;
   try {
-    const response = await fetch("/api/settings", {
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
     });
     const result = await response.json();
     if (!response.ok || !result.ok) {
@@ -1375,12 +1556,13 @@ async function saveSettings() {
       return;
     }
     showFormErrors([]);
-    $("settingsHint").textContent = "Сохранено. Переподключение к брокеру…";
+    applySettings(result.settings);
+    $("settingsHint").textContent = wasNew
+      ? "Создано и подключено. Переподключение к брокеру…"
+      : "Сохранено. Переподключение к брокеру…";
     setTimeout(() => {
       closeSettings();
-      pollStatus();
-      loadChannels();
-      loadGraph();
+      reloadGraphData();
     }, 600);
   } catch (error) {
     showFormErrors([String(error)]);
@@ -1578,6 +1760,8 @@ function init() {
   $("settingsClose").addEventListener("click", closeSettings);
   $("settingsCancel").addEventListener("click", closeSettings);
   $("settingsSave").addEventListener("click", saveSettings);
+  $("setConnection").addEventListener("change", onConnectionChange);
+  $("connDelete").addEventListener("click", deleteConnection);
   ["setPrefix", "setSuffix"].forEach((id) =>
     $(id).addEventListener("input", updateTopicPreview)
   );
