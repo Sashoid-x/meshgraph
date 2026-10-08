@@ -135,18 +135,23 @@ def _slug(text: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-") or "server"
 
 
-def _connection_identity(broker: Any, port: Any, prefix: Any) -> tuple[str, int, str]:
-    """The (broker, port, topic prefix) triple that identifies a server.
+def _connection_identity(
+    broker: Any, port: Any, prefix: Any, suffix: Any
+) -> tuple[str, int, str]:
+    """The (broker, port, subscribe topic) triple identifying a data stream.
 
-    The broker part is case-insensitive (it is DNS), the topic prefix is not
-    (MQTT topics are case-sensitive).  A changed triple means a different
-    server: a new connection with a clean database of its own.
+    The topic is prefix + suffix — exactly what the worker subscribes to:
+    another topic on the same broker delivers another network's packets, so
+    it deserves a connection and a database of its own.  The broker part is
+    case-insensitive (it is DNS), topics are not (MQTT topics are
+    case-sensitive).  A changed triple means a different server.
     """
     try:
         port_number = int(port)
     except (TypeError, ValueError):
         port_number = -1
-    return (str(broker or "").strip().lower(), port_number, str(prefix or ""))
+    topic = f"{prefix or ''}{suffix or ''}"
+    return (str(broker or "").strip().lower(), port_number, topic)
 
 
 def _profile_identity(profile: dict[str, Any]) -> tuple[str, int, str]:
@@ -154,16 +159,17 @@ def _profile_identity(profile: dict[str, Any]) -> tuple[str, int, str]:
         profile.get("mqtt_broker_address"),
         profile.get("mqtt_port"),
         profile.get("mqtt_topic_prefix"),
+        profile.get("mqtt_topic_suffix"),
     )
 
 
-def _default_connection_name(broker: Any, port: Any, prefix: Any) -> str:
-    return f"{broker}:{port} ({prefix})"
+def _default_connection_name(broker: Any, port: Any, topic: Any) -> str:
+    return f"{broker}:{port} ({topic})"
 
 
-def _derive_connection_id(broker: Any, prefix: Any, taken: list[str]) -> str:
-    """A stable id derived from the server identity, unique among ``taken``."""
-    base = f"{_slug(broker)}-{_slug(prefix)}"
+def _derive_connection_id(broker: Any, topic: Any, taken: list[str]) -> str:
+    """A stable id derived from broker + subscribe topic, unique among ``taken``."""
+    base = f"{_slug(broker)}-{_slug(topic)}"
     candidate = base
     suffix = 2
     while candidate in taken:
@@ -266,7 +272,8 @@ def _normalize_profiles(raw: Any) -> list[dict[str, Any]]:
         if not pid or pid in seen:
             pid = _derive_connection_id(
                 profile.get("mqtt_broker_address"),
-                profile.get("mqtt_topic_prefix"),
+                f"{profile.get('mqtt_topic_prefix') or ''}"
+                f"{profile.get('mqtt_topic_suffix') or ''}",
                 seen,
             )
         profile["id"] = pid
@@ -281,7 +288,8 @@ def _normalize_profiles(raw: Any) -> list[dict[str, Any]]:
             profile["name"] = _default_connection_name(
                 profile.get("mqtt_broker_address"),
                 profile.get("mqtt_port"),
-                profile.get("mqtt_topic_prefix"),
+                f"{profile.get('mqtt_topic_prefix') or ''}"
+                f"{profile.get('mqtt_topic_suffix') or ''}",
             )
     return profiles
 
@@ -296,7 +304,10 @@ def _retarget_active(settings: Settings, previous: dict[str, Any]) -> None:
     still points at the old connection's data.
     """
     identity = _connection_identity(
-        settings.mqtt_broker_address, settings.mqtt_port, settings.mqtt_topic_prefix
+        settings.mqtt_broker_address,
+        settings.mqtt_port,
+        settings.mqtt_topic_prefix,
+        settings.mqtt_topic_suffix,
     )
     profiles = settings.connections
     match = next((p for p in profiles if _profile_identity(p) == identity), None)
@@ -314,12 +325,12 @@ def _retarget_active(settings: Settings, previous: dict[str, Any]) -> None:
 
     taken = [str(p.get("id") or "") for p in profiles]
     pid = _derive_connection_id(
-        settings.mqtt_broker_address, settings.mqtt_topic_prefix, taken
+        settings.mqtt_broker_address, settings.subscribe_topic, taken
     )
     name = str(settings.connection_name or "").strip()
     if not name or name == previous.get("connection_name"):
         name = _default_connection_name(
-            settings.mqtt_broker_address, settings.mqtt_port, settings.mqtt_topic_prefix
+            settings.mqtt_broker_address, settings.mqtt_port, settings.subscribe_topic
         )
     profile = _profile_from_flat(
         settings,
@@ -566,6 +577,7 @@ class SettingsStore:
                 current.mqtt_broker_address,
                 current.mqtt_port,
                 current.mqtt_topic_prefix,
+                current.mqtt_topic_suffix,
             )
             if identity != _profile_identity(active_profile):
                 # A new server in the same dialog: another connection with a
@@ -599,12 +611,12 @@ class SettingsStore:
         profiles = _normalize_profiles(settings.connections)
         if not profiles:
             pid = _derive_connection_id(
-                settings.mqtt_broker_address, settings.mqtt_topic_prefix, []
+                settings.mqtt_broker_address, settings.subscribe_topic, []
             )
             name = _default_connection_name(
                 settings.mqtt_broker_address,
                 settings.mqtt_port,
-                settings.mqtt_topic_prefix,
+                settings.subscribe_topic,
             )
             settings.connections = [
                 _profile_from_flat(settings, pid, name, settings.db_file)
@@ -618,6 +630,7 @@ class SettingsStore:
             settings.mqtt_broker_address,
             settings.mqtt_port,
             settings.mqtt_topic_prefix,
+            settings.mqtt_topic_suffix,
         )
 
         active = next(
@@ -671,6 +684,7 @@ class SettingsStore:
             current.mqtt_broker_address,
             current.mqtt_port,
             current.mqtt_topic_prefix,
+            current.mqtt_topic_suffix,
         )
         match = next(
             (p for p in current.connections if _profile_identity(p) == identity),
@@ -679,13 +693,13 @@ class SettingsStore:
         if match is None:
             taken = [str(p.get("id") or "") for p in current.connections]
             pid = _derive_connection_id(
-                current.mqtt_broker_address, current.mqtt_topic_prefix, taken
+                current.mqtt_broker_address, current.subscribe_topic, taken
             )
             name = str(fields.get("connection_name") or "").strip() or (
                 _default_connection_name(
                     current.mqtt_broker_address,
                     current.mqtt_port,
-                    current.mqtt_topic_prefix,
+                    current.subscribe_topic,
                 )
             )
             profile = _profile_from_flat(

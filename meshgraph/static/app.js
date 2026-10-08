@@ -1384,19 +1384,11 @@ function updateConnectionDbHint(settings) {
 }
 
 function enterNewConnectionMode() {
+  // «Новое подключение» начинается с копии текущего: брокер, порт, TLS,
+  // учётные данные и ключи уже на месте — меняется только нужное (чаще
+  // всего топик), и у нового подключения появляется своя база. Идентичная
+  // копия на сервере не плодится: система переключит на существующее.
   newConnectionMode = true;
-  // Чистый лист для нового сервера: поля подключения обнуляются, ключи
-  // каналов остаются (частый случай — та же сеть на другом брокере).
-  $("setBroker").value = "";
-  $("setPort").value = "1883";
-  $("setUser").value = "";
-  $("setPass").value = "";
-  $("setPass").placeholder = "необязательно";
-  $("setPrefix").value = "msh";
-  $("setSuffix").value = "/+/+/+/#";
-  $("setClientId").value = "";
-  $("setTls").checked = false;
-  $("setTlsInsecure").checked = false;
   $("setConnName").value = "";
   const file = $("connDbFile");
   if (file) file.textContent = "новая база будет создана после сохранения";
@@ -1404,9 +1396,9 @@ function enterNewConnectionMode() {
   if (del) del.disabled = true;
   showFormErrors([]);
   $("settingsHint").textContent =
-    "Новое подключение: укажите сервер и сохраните — ему будет создана своя база данных.";
+    "Копия текущего подключения: измените нужное (например, топик) и сохраните — новое подключение получит свою базу данных.";
   updateTopicPreview();
-  setTimeout(() => $("setBroker").focus(), 50);
+  setTimeout(() => $("setSuffix").focus(), 50);
 }
 
 async function switchConnection(pid) {
@@ -1556,10 +1548,20 @@ async function saveSettings() {
       return;
     }
     showFormErrors([]);
+    const beforeId = lastSettings ? lastSettings.active_connection : "";
+    const beforeCount = lastSettings ? (lastSettings.connections || []).length : 0;
+    const afterCount = (result.settings.connections || []).length;
     applySettings(result.settings);
-    $("settingsHint").textContent = wasNew
-      ? "Создано и подключено. Переподключение к брокеру…"
-      : "Сохранено. Переподключение к брокеру…";
+    if (!wasNew) {
+      $("settingsHint").textContent = "Сохранено. Переподключение к брокеру…";
+    } else if (afterCount > beforeCount) {
+      $("settingsHint").textContent = "Создано и подключено. Переподключение к брокеру…";
+    } else if (result.settings.active_connection !== beforeId) {
+      $("settingsHint").textContent =
+        "Такое подключение уже было — переключились на него, ничего не создано.";
+    } else {
+      $("settingsHint").textContent = "Это подключение уже есть — ничего не создано.";
+    }
     setTimeout(() => {
       closeSettings();
       reloadGraphData();
@@ -1762,6 +1764,9 @@ function init() {
   $("settingsSave").addEventListener("click", saveSettings);
   $("setConnection").addEventListener("change", onConnectionChange);
   $("connDelete").addEventListener("click", deleteConnection);
+  // Enter в поле настроек не должен перезагружать страницу (неявная
+  // отправка формы): сохранение — только кнопкой «Сохранить».
+  $("settingsForm").addEventListener("submit", (event) => event.preventDefault());
   ["setPrefix", "setSuffix"].forEach((id) =>
     $(id).addEventListener("input", updateTopicPreview)
   );

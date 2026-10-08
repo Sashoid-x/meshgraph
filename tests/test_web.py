@@ -447,6 +447,10 @@ def test_page_wires_the_connection_selector(client):
     assert "/api/connections/select" in app_js
     assert "Новое подключение" in app_js
     assert "CONNECTION_FIELDS" in app_js
+    # The new-connection mode starts as a copy of the current one, and Enter
+    # inside the dialog must not reload the page (implicit form submit).
+    assert "Копия текущего подключения" in app_js
+    assert 'addEventListener("submit"' in app_js
 
 
 def test_status_reports_the_active_connection(client):

@@ -250,6 +250,42 @@ def test_topic_prefix_change_also_splits(settings_store):
     assert settings.db_file == "data/127-0-0-1-othernet.db"
 
 
+def test_topic_suffix_change_also_splits(settings_store):
+    """The topic is prefix + suffix: another suffix is another data stream."""
+    settings_store.update(mqtt_topic_suffix="/RU/BLK/#")
+    settings = settings_store.get()
+    assert len(settings.connections) == 2
+    old = next(
+        p for p in settings.connections if p["id"] != settings.active_connection
+    )
+    # The source connection keeps its own topic and its own file.
+    assert old["mqtt_topic_suffix"] == "/+/+/+/#"
+    assert old["db_file"] == "data/graph.db"
+    # The copy's id and database come from the full subscribe topic.
+    assert settings.db_file == "data/127-0-0-1-msh-ru-blk.db"
+    assert settings.mqtt_topic_suffix == "/RU/BLK/#"
+
+
+def test_add_connection_with_another_topic_copies_the_server(settings_store):
+    """Reported case: same broker, only the topic differs → own connection."""
+    settings = settings_store.add_connection(mqtt_topic_suffix="/RU/BLK/#")
+    assert len(settings.connections) == 2
+    # Broker, port, TLS and credentials are inherited from the active one.
+    assert settings.mqtt_broker_address == "127.0.0.1"
+    assert settings.mqtt_port == 1883
+    assert settings.db_file == "data/127-0-0-1-msh-ru-blk.db"
+    assert settings.connection_name == "127.0.0.1:1883 (msh/RU/BLK/#)"
+    # The source connection is intact.
+    source = next(p for p in settings.connections if p["id"] == "127-0-0-1-msh")
+    assert source["mqtt_topic_suffix"] == "/+/+/+/#"
+    assert source["db_file"] == "data/graph.db"
+
+    # Saving the very same copy again does not create a twin.
+    again = settings_store.add_connection(mqtt_topic_suffix="/RU/BLK/#")
+    assert len(again.connections) == 2
+    assert again.active_connection == "127-0-0-1-msh-ru-blk"
+
+
 def test_port_change_splits_too(settings_store):
     settings_store.update(mqtt_port=8883, mqtt_tls=True)
     settings = settings_store.get()
@@ -266,7 +302,9 @@ def test_add_connection_creates_and_activates(settings_store):
     settings = settings_store.get()
     assert settings.active_connection == "mesh-example-mesh"
     assert settings.db_file == "data/mesh-example-mesh.db"
-    assert settings.connection_name == "mesh.example:1883 (mesh)"
+    # Default name carries the full subscribe topic — two topics on the same
+    # broker must not look alike in the selector.
+    assert settings.connection_name == "mesh.example:1883 (mesh/+/+/+/#)"
     assert len(settings.connections) == 2
 
 
