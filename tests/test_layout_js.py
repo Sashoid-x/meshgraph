@@ -643,3 +643,64 @@ def test_collage_grid_adapts_to_the_image_count(links_js):
 def test_link_host_is_taken_without_path_or_scheme(links_js):
     assert run(links_js, "meshgraphLinkHost('https://meshpic.org/w6i')") == "meshpic.org"
     assert run(links_js, "meshgraphLinkHost('http://192.168.1.5:8080/a')") == "192.168.1.5"
+
+
+def test_collage_renders_the_resolved_image_not_the_link_page():
+    """Страница обменника (junkdata /v/, meshpic /AbC) — это HTML: в img
+    Chromium блокирует её как ORB-ответ, и картинка деградирует в чип.
+    Ячейка обязана рисовать preview.url, а не ссылку из сообщения."""
+    src = APP_JS.read_text(encoding="utf-8")
+    assert "meshgraphResolvedImage(" in src
+    assert "img.src = item.src;" in src
+    # Битая клетка отдаёт клик на страницу-оригинал из сообщения.
+    assert "window.open(item.page" in src
+
+
+def test_image_groups_merge_links_separated_by_whitespace(links_js):
+    # «url url\nurl» — одна картинка-группа: пробелы и переносы не рвут её.
+    result = run(
+        links_js,
+        """meshgraphImageGroups(
+            meshgraphSplitLinks("https://a.example/1 https://a.example/2\\nhttps://a.example/3 конец"),
+            () => "image")""",
+    )
+    assert result == [{
+        "start": 0, "end": 5,
+        "urls": ["https://a.example/1", "https://a.example/2",
+                 "https://a.example/3"],
+    }]
+
+
+def test_real_text_keeps_two_groups_in_order(links_js):
+    # Текст между картинками: коллаж, текст, коллаж — очерёдность свята.
+    result = run(
+        links_js,
+        """meshgraphImageGroups(
+            meshgraphSplitLinks("https://a.example/1 середина https://a.example/2"),
+            () => "image")""",
+    )
+    assert result == [
+        {"start": 0, "end": 1, "urls": ["https://a.example/1"]},
+        {"start": 2, "end": 3, "urls": ["https://a.example/2"]},
+    ]
+
+
+def test_non_image_link_breaks_the_group(links_js):
+    result = run(
+        links_js,
+        """meshgraphImageGroups(
+            meshgraphSplitLinks("https://a.example/pic/1 https://a.example/page"),
+            (url) => url.includes("/pic/") ? "image" : "page")""",
+    )
+    assert result == [{"start": 0, "end": 2, "urls": ["https://a.example/pic/1"]}]
+
+
+def test_pending_links_form_no_groups(links_js):
+    # Пока превью не пришло — ссылки рендерятся чипами, коллаж появится
+    # после перерисовки.
+    assert run(
+        links_js,
+        """meshgraphImageGroups(
+            meshgraphSplitLinks("https://a.example/1 https://a.example/2"),
+            () => "pending")""",
+    ) == []

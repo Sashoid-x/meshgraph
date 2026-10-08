@@ -44,6 +44,39 @@ function meshgraphTrimUrl(url) {
   return url.slice(0, end);
 }
 
+// Какие картинки складывать в один коллаж: соседние ссылки, между которыми
+// только пробелы и переносы строк («url url url» — одно сообщение, а не
+// четыре). Реальный текст разрывает группу и остаётся на своём месте.
+// kindOf(url) → "image" | "page" | "pending" | "error".
+function meshgraphImageGroups(segments, kindOf) {
+  const groups = [];
+  let i = 0;
+  while (i < segments.length) {
+    const seg = segments[i];
+    if (seg.type !== "link" || kindOf(seg.url) !== "image") {
+      i += 1;
+      continue;
+    }
+    const urls = [];
+    let j = i;
+    while (j < segments.length) {
+      const inner = segments[j];
+      if (inner.type === "link") {
+        if (kindOf(inner.url) !== "image") break;
+        urls.push(inner.url);
+        j += 1;
+      } else if (inner.text.trim() === "") {
+        j += 1;  // пробел между ссылками коллаж не разрывает
+      } else {
+        break;
+      }
+    }
+    groups.push({ start: i, end: j, urls });
+    i = j > i ? j : i + 1;
+  }
+  return groups;
+}
+
 // How many pictures a collage shows: up to six cells, beyond that five
 // pictures plus a «+N» tile (the lightbox still opens the full list).
 function meshgraphCollageGrid(count) {

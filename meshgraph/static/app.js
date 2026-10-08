@@ -1056,33 +1056,36 @@ function chatMessageEl(msg) {
 // ---------------------------------------------------------------------------
 
 // Пузырь со ссылками: текст и ссылки идут в исходном порядке, соседние
-// картинки складываются в один коллаж (очередь соседнего текста не меняется).
+// картинки (даже разделённые пробелами) складываются в один коллаж.
 function appendChatSegments(bubble, msg) {
   const segments = meshgraphSplitLinks(msg.text || "");
+  const groups = meshgraphImageGroups(segments, meshgraphPreviewKind);
+  let groupIndex = 0;
   let i = 0;
   while (i < segments.length) {
+    const group =
+      groupIndex < groups.length && groups[groupIndex].start === i
+        ? groups[groupIndex]
+        : null;
+    if (group) {
+      bubble.appendChild(
+        chatCollageEl(group.urls.map((url) => ({
+          // Страница обменника (…/v/…) — не картинка: браузер заблокировал бы
+          // её как ORB-ответ, поэтому рисуем раскрытую preview.url.
+          src: meshgraphResolvedImage(url),
+          page: url,
+        })))
+      );
+      i = group.end;
+      groupIndex += 1;
+      continue;
+    }
     const segment = segments[i];
     if (segment.type === "text") {
       bubble.appendChild(chatEl("div", "chat-text", segment.text));
-      i += 1;
-      continue;
+    } else {
+      bubble.appendChild(chatLinkEl(segment.url));
     }
-    const run = [];
-    let j = i;
-    while (
-      j < segments.length &&
-      segments[j].type === "link" &&
-      meshgraphPreviewKind(segments[j].url) === "image"
-    ) {
-      run.push(segments[j].url);
-      j += 1;
-    }
-    if (run.length) {
-      bubble.appendChild(chatCollageEl(run));
-      i = j;
-      continue;
-    }
-    bubble.appendChild(chatLinkEl(segment.url));
     i += 1;
   }
 }
@@ -1090,6 +1093,13 @@ function appendChatSegments(bubble, msg) {
 function meshgraphPreviewKind(url) {
   const preview = state.linkPreviews.get(url);
   return preview ? preview.kind : "pending";
+}
+
+// Картинка, которую реально можно рисовать: у превью это итоговый адрес
+// (после редиректа или из og:image), а не сама ссылка из сообщения.
+function meshgraphResolvedImage(url) {
+  const preview = state.linkPreviews.get(url);
+  return preview && preview.kind === "image" && preview.url ? preview.url : url;
 }
 
 // Ссылка: до прихода превью — компактный чип с хостом, после — карточка
@@ -1139,34 +1149,35 @@ function chatCardEl(url, preview) {
 
 // Коллаж соседних картинок: клетки-квадраты (1 — картинка целиком),
 // по клику — лайтбокс на весь список. Протухшая ссылка (обменники живут
-// недолго) превращается в чип на оригинал, а не в пустую плитку.
-function chatCollageEl(urls) {
-  const grid = meshgraphCollageGrid(urls.length);
+// недолго) превращается в чип на страницу-оригинал, а не в пустую плитку.
+function chatCollageEl(items) {
+  const gallery = items.map((item) => item.src);
+  const grid = meshgraphCollageGrid(items.length);
   const wrap = chatEl("div", "chat-collage");
   wrap.dataset.n = String(grid.shown + (grid.extra ? 1 : 0));
-  urls.slice(0, grid.shown).forEach((url, index) => {
+  items.slice(0, grid.shown).forEach((item, index) => {
     const cell = chatEl("button", "chat-collage-cell");
     cell.type = "button";
     cell.title = "Показать";
     const img = document.createElement("img");
-    img.src = url;
+    img.src = item.src;
     img.loading = "lazy";
     img.decoding = "async";
     img.alt = "Картинка из ссылки";
     img.addEventListener("error", () => {
       cell.dataset.broken = "1";
       cell.classList.add("chat-collage-broken");
-      cell.title = url;
+      cell.title = item.page;
       img.remove();
-      cell.appendChild(chatEl("span", "", meshgraphLinkHost(url)));
+      cell.appendChild(chatEl("span", "", meshgraphLinkHost(item.page)));
     });
     cell.appendChild(img);
     cell.addEventListener("click", () => {
       if (cell.dataset.broken === "1") {
-        window.open(url, "_blank", "noopener");
+        window.open(item.page, "_blank", "noopener");
         return;
       }
-      openLightbox(urls, index);
+      openLightbox(gallery, index);
     });
     wrap.appendChild(cell);
   });
@@ -1174,7 +1185,7 @@ function chatCollageEl(urls) {
     const more = chatEl("button", "chat-collage-more", `+${grid.extra}`);
     more.type = "button";
     more.title = "Показать все картинки";
-    more.addEventListener("click", () => openLightbox(urls, grid.shown));
+    more.addEventListener("click", () => openLightbox(gallery, grid.shown));
     wrap.appendChild(more);
   }
   return wrap;
