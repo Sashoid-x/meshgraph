@@ -220,6 +220,10 @@
     </div>
     <div class="tooltip" id="tooltip" hidden></div>
     <div class="canvas-controls">
+      <div class="view-switch" title="Вид графа">
+        <button class="view-btn is-active" id="view2dBtn" type="button">2D</button>
+        <button class="view-btn" id="view3dBtn" type="button">3D</button>
+      </div>
       <button class="icon-btn" id="zoomIn" title="Приблизить">＋</button>
       <button class="icon-btn" id="zoomOut" title="Отдалить">−</button>
       <button class="icon-btn" id="zoomFit" title="Вписать">⤢</button>
@@ -447,8 +451,13 @@
 </script>
 <script src="{{ url_for('static', filename='d3.v7.min.js') }}"></script>
 <script src="{{ url_for('static', filename='layout.js') }}"></script>
+<script src="{{ url_for('static', filename='force3d.js') }}"></script>
 <script src="{{ url_for('static', filename='pixelart.js') }}"></script>
 <script src="{{ url_for('static', filename='chatlinks.js') }}"></script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
+<script type="importmap">
+{ "imports": { "three": "{{ url_for('static', filename='three.module.min.js') }}" } }
+</script>
+<script type="module" src="{{ url_for('static', filename='graph3d.js') }}"></script>
 </body>
 </html>

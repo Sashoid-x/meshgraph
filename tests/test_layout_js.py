@@ -704,3 +704,247 @@ def test_pending_links_form_no_groups(links_js):
             meshgraphSplitLinks("https://a.example/1 https://a.example/2"),
             () => "pending")""",
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# 3D force layout (force3d.js)
+# ---------------------------------------------------------------------------
+
+FORCE3D_JS = ROOT / "meshgraph" / "static" / "force3d.js"
+GRAPH3D_JS = ROOT / "meshgraph" / "static" / "graph3d.js"
+INDEX_HTML = ROOT / "meshgraph" / "templates" / "index.html"
+
+
+@pytest.fixture(scope="module")
+def js3d() -> "quickjs.Context":
+    ctx = quickjs.Context()
+    ctx.eval(FORCE3D_JS.read_text(encoding="utf-8"))
+    return ctx
+
+
+def test_anchor_points_ring_and_singleton(js3d):
+    assert run(js3d, "meshgraphAnchorPoints3D(1, 340)") == [
+        {"x": 0, "y": 0, "z": 0}
+    ]
+    ring = run(js3d, "meshgraphAnchorPoints3D(4, 340)")
+    assert len(ring) == 4
+    # Все якорья лежат в горизонтальной плоскости, на одном радиусе,
+    # соседние — на равном расстоянии (хорда = исходный spacing).
+    assert all(p["y"] == 0 for p in ring)
+    radii = [(p["x"] ** 2 + p["z"] ** 2) ** 0.5 for p in ring]
+    assert max(radii) - min(radii) < 1e-6
+    chords = []
+    for i in range(4):
+        a, b = ring[i], ring[(i + 1) % 4]
+        chords.append(((a["x"] - b["x"]) ** 2 + (a["z"] - b["z"]) ** 2) ** 0.5)
+    assert max(chords) - min(chords) < 1e-6
+    assert abs(chords[0] - 340) < 1e-6
+
+
+def test_seed_fills_depth_and_is_deterministic(js3d):
+    # Без предыдущих координат спираль даёт объём (z не плоский ноль),
+    # повторный посев на тех же входах воспроизводит те же координаты.
+    result = run(
+        js3d,
+        """(function () {
+            const nodes = Array.from({length: 30}, (_, i) => ({id: i}));
+            const anchors = nodes.map(() => ({x: 0, y: 0, z: 0}));
+            meshgraphSeedPositions3D(nodes, null, anchors, MESHGRAPH_FORCE3D_PARAMS);
+            const first = nodes.map(n => [n.x, n.y, n.z]);
+            meshgraphSeedPositions3D(nodes, null, anchors, MESHGRAPH_FORCE3D_PARAMS);
+            const same = JSON.stringify(first) === JSON.stringify(
+                nodes.map(n => [n.x, n.y, n.z]));
+            return {
+                same,
+                finite: nodes.every(n => isFinite(n.x) && isFinite(n.y) && isFinite(n.z)),
+                flat: nodes.every(n => n.z === 0),
+            };
+        })()""",
+    )
+    assert result["same"] and result["finite"]
+    assert not result["flat"]
+
+
+def test_seed_inherits_prev_positions_and_zeroes_speeds(js3d):
+    # 3D-наследник: x/y/z остаются прежними, старые скорости гаснут —
+    # иначе унаследованный импульс увёл бы сцену с экрана.
+    result = run(
+        js3d,
+        """(function () {
+            const nodes = [{id: 1}];
+            const prev = new Map([[1, {id: 1, x: 5, y: 6, z: 7, vx: 9, vy: 9, vz: 9}]]);
+            const anchors = [{x: 0, y: 0, z: 0}];
+            meshgraphSeedPositions3D(nodes, prev, anchors, MESHGRAPH_FORCE3D_PARAMS);
+            const n = nodes[0];
+            return {x: n.x, y: n.y, z: n.z, vx: n.vx, vy: n.vy, vz: n.vz};
+        })()""",
+    )
+    assert result == {"x": 5, "y": 6, "z": 7, "vx": 0, "vy": 0, "vz": 0}
+
+
+def test_seed_from_flat_2d_prev_gains_depth(js3d):
+    # Узлы из 2D не имеют z вовсе (undefined): координаты x/y держим,
+    # а глубину донашиваем спиралью — иначе переключение даёт «блин».
+    result = run(
+        js3d,
+        """(function () {
+            const nodes = Array.from({length: 12}, (_, i) => ({id: i}));
+            const prev = new Map(nodes.map(n => [n.id, {id: n.id, x: 100, y: 50}]));
+            const anchors = nodes.map(() => ({x: 0, y: 0, z: 0}));
+            meshgraphSeedPositions3D(nodes, prev, anchors, MESHGRAPH_FORCE3D_PARAMS);
+            return {
+                xyKept: nodes.every(n => n.x === 100 && n.y === 50),
+                zFinite: nodes.every(n => isFinite(n.z)),
+                someZ: nodes.some(n => Math.abs(n.z) > 1),
+            };
+        })()""",
+    )
+    assert result["xyKept"] and result["zFinite"] and result["someZ"]
+
+
+def test_link_springs_pull_to_rest_distance(js3d):
+    # Одиночная связь без конкурирующих сил: растянутая пара сжимается,
+    # сжатая — расправляется к естественной длине связи.
+    result = run(
+        js3d,
+        """(function () {
+            const p = Object.assign({}, MESHGRAPH_FORCE3D_PARAMS, {
+                chargeStrength: 0, anchorStrength: 0, collisionPad: 0});
+            const far = [{id: 0, x: 0, y: 0, z: 0}, {id: 1, x: 900, y: 0, z: 0}];
+            const near = [{id: 0, x: 0, y: 0, z: 0}, {id: 1, x: 40, y: 0, z: 0}];
+            const pairs = [[0, 1]];
+            const noAnchors = [null, null];
+            for (let i = 0; i < 60; i += 1) {
+                meshgraphForce3DStep(far, pairs, noAnchors, 1, p);
+                meshgraphForce3DStep(near, pairs, noAnchors, 1, p);
+            }
+            return {
+                far: Math.abs(far[1].x - far[0].x),
+                near: Math.abs(near[1].x - near[0].x),
+            };
+        })()""",
+    )
+    # alpha держим на 1 — просто несколько десятков шагов подряд.
+    assert 100 < result["far"] < 300  # было 900 → потянулось к покою
+    assert 60 < result["near"] < 240  # было 40 → расправилось к пок
+
+
+def test_repulsion_pushes_unlinked_nodes_apart(js3d):
+    result = run(
+        js3d,
+        """(function () {
+            const p = Object.assign({}, MESHGRAPH_FORCE3D_PARAMS, {
+                anchorStrength: 0, collisionPad: 0});
+            const nodes = [{id: 0, x: 0, y: 0, z: 0}, {id: 1, x: 50, y: 0, z: 0}];
+            for (let i = 0; i < 30; i += 1) {
+                meshgraphForce3DStep(nodes, [], [null, null], 1, p);
+            }
+            return Math.hypot(nodes[1].x - nodes[0].x, nodes[1].y - nodes[0].y,
+                              nodes[1].z - nodes[0].z);
+        })()""",
+    )
+    assert result > 50
+
+
+def test_collision_keeps_node_bodies_apart(js3d):
+    # Совпадающие центры: детерминированная ось + половинное исправление
+    # позиции разводят узлы ровно на сумму радиусов с отступом.
+    result = run(
+        js3d,
+        """(function () {
+            const p = Object.assign({}, MESHGRAPH_FORCE3D_PARAMS, {
+                chargeStrength: 0, anchorStrength: 0});
+            const nodes = [{id: 0, x: 0, y: 0, z: 0, size: 10},
+                           {id: 1, x: 0, y: 0, z: 0, size: 10}];
+            for (let i = 0; i < 30; i += 1) {
+                meshgraphForce3DStep(nodes, [], [null, null], 1, p);
+            }
+            return Math.hypot(nodes[1].x - nodes[0].x, nodes[1].y - nodes[0].y,
+                              nodes[1].z - nodes[0].z);
+        })()""",
+    )
+    # size 10 + 10 + collisionPad 34 = 54, с допуском на округление.
+    assert result >= 54 - 0.01
+
+
+def test_islands_converge_to_their_own_anchors(js3d):
+    # Две части без связей разъезжаются к своим якорьям, а не слипаются.
+    result = run(
+        js3d,
+        """(function () {
+            const p = Object.assign({}, MESHGRAPH_FORCE3D_PARAMS, {
+                chargeStrength: 0, collisionPad: 0});
+            const nodes = [{id: 0, x: 0, y: 0, z: 0}, {id: 1, x: 0, y: 0, z: 0}];
+            const anchors = [{x: 1000, y: 0, z: 0}, {x: -1000, y: 0, z: 0}];
+            meshgraphRun3D(nodes, [], anchors, 200, p);
+            return {
+                d0: Math.hypot(nodes[0].x - 1000, nodes[0].y, nodes[0].z),
+                d1: Math.hypot(nodes[1].x + 1000, nodes[1].y, nodes[1].z),
+            };
+        })()""",
+    )
+    assert result["d0"] < 200 and result["d1"] < 200
+
+
+def test_alpha_decays_to_zero(js3d):
+    result = run(
+        js3d,
+        """(function () {
+            const p = MESHGRAPH_FORCE3D_PARAMS;
+            const once = meshgraphDecayAlpha3D(1, p);
+            const tiny = meshgraphDecayAlpha3D(p.alphaMin / 2, p);
+            const nodes = Array.from({length: 6}, (_, i) => ({id: i, x: i * 40, y: 0, z: 0}));
+            const pairs = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5]];
+            const anchors = nodes.map(() => ({x: 0, y: 0, z: 0}));
+            const left = meshgraphRun3D(nodes, pairs, anchors, 100000, p);
+            return {once, tiny, left,
+                    finite: nodes.every(n => isFinite(n.x) && isFinite(n.y)
+                                             && isFinite(n.z))};
+        })()""",
+    )
+    assert result["once"] < 1
+    assert result["tiny"] == 0
+    assert result["left"] == 0  # длинная цепочка доиграла до покоя
+    assert result["finite"]
+
+
+def test_step_with_zero_alpha_moves_nothing(js3d):
+    result = run(
+        js3d,
+        """(function () {
+            const p = MESHGRAPH_FORCE3D_PARAMS;
+            const nodes = [{id: 0, x: 1, y: 2, z: 3, vx: 0, vy: 0, vz: 0}];
+            meshgraphForce3DStep(nodes, [], [null], 0, p);
+            return [nodes[0].x, nodes[0].y, nodes[0].z];
+        })()""",
+    )
+    assert result == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# 3D wiring (module compiles, template and app.js hook it up)
+# ---------------------------------------------------------------------------
+
+
+def test_graph3d_module_compiles():
+    """Compile (not run) graph3d.js: imports are stripped, three.js has no
+    QuickJS, everything else must parse."""
+    src = GRAPH3D_JS.read_text(encoding="utf-8")
+    stripped = "\n".join(
+        line for line in src.splitlines() if not line.startswith("import ")
+    )
+    quickjs.Context().eval("(function (){\n" + stripped + "\n})")
+
+
+def test_3d_view_wiring():
+    """The toggle, the import map and the module all ship together."""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert 'id="view2dBtn"' in html
+    assert 'id="view3dBtn"' in html
+    assert '"imports"' in html and "three.module.min.js" in html
+    assert "graph3d.js" in html and "force3d.js" in html
+    app = APP_JS.read_text(encoding="utf-8")
+    assert "renderGraph3D(" in app and "switchView(" in app
+    # Ветка 3D уводит выделение и зум в модуль, а не в d3.
+    assert "window.meshgraph3D.setSelection" in app
+    assert "window.meshgraph3D.focusNode" in app

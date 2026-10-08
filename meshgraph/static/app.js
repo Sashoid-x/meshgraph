@@ -188,6 +188,9 @@ function updateStats(data) {
 function renderGraph(data, prevNodes = null) {
   const container = d3.select("#graphCanvas");
   container.selectAll("*").remove();
+  // 3D-режим держит собственный rAF-цикл: пока холст пересобирается, гасим
+  // его, иначе рендер писал бы в отсоединённый canvas.
+  if (window.meshgraph3D) window.meshgraph3D.deactivate();
   state.nodeSel = null;
   state.linkSel = null;
   state.indirectSel = null;
@@ -243,6 +246,14 @@ function renderGraph(data, prevNodes = null) {
   const prevHeight = state.height;
   state.width = width;
   state.height = height;
+
+  // Трёхмерный вид: собственный рендер (graph3d.js + three.js), силы — из
+  // force3d.js. Если WebGL недоступен — возвращаемся в 2D тем же проходом.
+  if (viewMode() === "3d") {
+    if (renderGraph3D(data, prevNodes, width, height, structureSame)) return;
+    setViewMode("2d");
+    updateViewButtons();
+  }
 
   const svg = container
     .append("svg")
@@ -531,6 +542,100 @@ function renderGraph(data, prevNodes = null) {
 }
 
 // ---------------------------------------------------------------------------
+// 3D view mode (toggle 2D/3D, three.js render bridge)
+// ---------------------------------------------------------------------------
+
+const VIEW_MODE_KEY = "meshgraph.view";
+
+function viewMode() {
+  return storeGet(VIEW_MODE_KEY) === "3d" ? "3d" : "2d";
+}
+
+function setViewMode(mode) {
+  storeSet(VIEW_MODE_KEY, mode);
+}
+
+function updateViewButtons() {
+  const mode = viewMode();
+  if (!$("view2dBtn") || !$("view3dBtn")) return;
+  $("view2dBtn").classList.toggle("is-active", mode === "2d");
+  $("view3dBtn").classList.toggle("is-active", mode === "3d");
+}
+
+/**
+ * Switch between the views without refetching: the same data re-renders in
+ * the other dimension, node coordinates carry over (a 3D scene keeps its
+ * depth when falling back to the flat canvas).
+ */
+function switchView(mode) {
+  if (mode === viewMode()) return;
+  setViewMode(mode);
+  updateViewButtons();
+  if (!state.graph) return;
+  const prevNodes = new Map(state.graph.nodes.map((n) => [n.id, n]));
+  renderGraph(state.graph, prevNodes);
+  restoreSelection();
+}
+
+/**
+ * Hand the graph to window.meshgraph3D.  Returns false when the module or
+ * WebGL is missing — renderGraph then falls through to the 2D path.
+ *
+ * Unlike d3, three.js needs resolved link endpoints up front: the details
+ * panel and the tooltips read link.source.name directly.
+ */
+function renderGraph3D(data, prevNodes, width, height, structureSame) {
+  // The d3 simulation keeps ticking on its own — stop it, its ticks would
+  // keep mutating detached DOM.
+  if (state.simulation) {
+    state.simulation.stop();
+    state.simulation = null;
+  }
+  state.islandTargets = null;
+  state.viewTransform = null;
+  if (!window.meshgraph3D) return false;
+
+  const nodeById = new Map(data.nodes.map((n) => [n.id, n]));
+  const resolve = (v) =>
+    (v !== null && typeof v === "object" ? v : nodeById.get(v)) || v;
+  data.links.forEach((l) => {
+    l.source = resolve(l.source);
+    l.target = resolve(l.target);
+  });
+  (data.indirect_connections || []).forEach((l) => {
+    l.source = resolve(l.source);
+    l.target = resolve(l.target);
+  });
+
+  return window.meshgraph3D.render({
+    nodes: data.nodes,
+    links: data.links,
+    indirect: data.indirect_connections || [],
+    width,
+    height,
+    structureSame,
+    prevNodes,
+    selectedNodeId: state.selectedNodeId,
+    selectedLinkKey: state.selectedLinkKey,
+    color: snrColor(),
+    linkKey,
+    callbacks: {
+      onNodeClick: (node, event) =>
+        select(null, state.selectedNodeId === node.id ? null : node),
+      onLinkClick: (link, event) => {
+        const key = linkKey(link);
+        select(state.selectedLinkKey === key ? null : link, null);
+      },
+      onNodeHover: (node, event) => showNodeTip(event, node),
+      onLinkHover: (link, event) => showLinkTip(event, link),
+      onIndirectHover: (link, event) => showIndirectTip(event, link),
+      onLeave: hideTip,
+      onBlankClick: () => select(null, null),
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Selection & highlighting
 // ---------------------------------------------------------------------------
 
@@ -543,6 +648,22 @@ function linkKey(link) {
 function select(link, node) {
   state.selectedLinkKey = link ? linkKey(link) : null;
   state.selectedNodeId = node ? node.id : null;
+
+  // В 3D-режиме подсветку ведёт модуль (материалы/цвета), панель деталей —
+  // та же самая, что и в 2D.
+  if (viewMode() === "3d" && window.meshgraph3D) {
+    window.meshgraph3D.setSelection(
+      state.selectedNodeId,
+      state.selectedLinkKey
+    );
+    if (!link && !node) {
+      $("detailsPanel").hidden = true;
+      return;
+    }
+    if (node) renderNodeDetails(node);
+    else renderLinkDetails(link);
+    return;
+  }
 
   if (!state.nodeSel) return;
 
@@ -734,6 +855,10 @@ function showIndirectTip(event, d) {
 // ---------------------------------------------------------------------------
 
 function zoomBy(factor) {
+  if (viewMode() === "3d" && window.meshgraph3D) {
+    window.meshgraph3D.zoom(factor);
+    return;
+  }
   if (!state.svg || !state.zoom) return;
   state.svg.transition().duration(220).call(state.zoom.scaleBy, factor);
 }
@@ -754,6 +879,10 @@ function fitToCells(cells) {
 }
 
 function fitToContent() {
+  if (viewMode() === "3d" && window.meshgraph3D) {
+    window.meshgraph3D.fit();
+    return;
+  }
   if (!state.svg || !state.zoom || !state.g) return;
   const fit = meshgraphFitBoundsTransform(
     state.g.node().getBBox(),
@@ -771,6 +900,10 @@ function fitToContent() {
 }
 
 function focusOnNode(target) {
+  if (viewMode() === "3d" && window.meshgraph3D) {
+    window.meshgraph3D.focusNode(target.id);
+    return;
+  }
   if (!state.svg || !state.zoom) return;
   const fit = meshgraphFocusTransform(
     target.x,
@@ -2342,6 +2475,14 @@ function init() {
 
   $("clearSelection").addEventListener("click", () => select(null, null));
   $("nodeSearch").addEventListener("input", (e) => runSearch(e.target.value));
+
+  // Переключатель 2D/3D. Пустая проверка — на случай кэшированного шаблона
+  // без кнопок (статика обновляется раньше, чем перечитается index.html).
+  if ($("view2dBtn") && $("view3dBtn")) {
+    $("view2dBtn").addEventListener("click", () => switchView("2d"));
+    $("view3dBtn").addEventListener("click", () => switchView("3d"));
+    updateViewButtons();
+  }
 
   // Лайтбокс: крестик, стрелки, клик по фону, свайп и битая картинка.
   $("lightboxClose").addEventListener("click", closeLightbox);
