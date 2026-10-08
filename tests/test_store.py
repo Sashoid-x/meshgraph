@@ -343,7 +343,7 @@ def test_node_lookup_chunks_large_id_lists(settings, monkeypatch):
 
 def test_counters_track_dedup_and_prune(settings):
     """Process-lifetime totals surfaced in /api/graph stats (G-P2-1)."""
-    before = store.counters()
+    before = store.counters(settings.db_file)
 
     now = time.time()
     base = dict(from_node_id=5, gateway_node_id=5, mesh_packet_id=42)
@@ -369,27 +369,28 @@ def test_counters_track_dedup_and_prune(settings):
     )
     assert store.prune(settings.db_file, 24) == 1  # +1 packets_pruned_total
 
-    after = store.counters()
+    after = store.counters(settings.db_file)
     assert after["packets_deduplicated"] == before["packets_deduplicated"] + 1
     assert after["packets_pruned_total"] == before["packets_pruned_total"] + 1
 
 
-def test_counters_reset_when_the_database_changes(settings, tmp_path):
-    """Switching connections must not carry another server's counters over."""
+def test_counters_are_scoped_to_each_database(settings, tmp_path):
+    """One server's capture must not leak into another server's stats."""
     packet = make_packet(from_node_id=7, gateway_node_id=8, mesh_packet_id=42)
     assert store.insert_packet(settings.db_file, packet) is True
     assert store.insert_packet(settings.db_file, packet) is False  # duplicate
-    assert store.counters()["packets_deduplicated"] >= 1
+    assert store.counters(settings.db_file)["packets_deduplicated"] == 1
 
-    # Another database comes on screen → the totals describe it, not the old one.
-    store.init(str(tmp_path / "other-server.db"))
-    assert store.counters()["packets_deduplicated"] == 0
-    assert store.counters()["packets_pruned_total"] == 0
-
-    # Re-opening the very same file is not a switch: the totals stand.
+    # Another database gets its own totals, starting from zero.
     other = str(tmp_path / "other-server.db")
+    store.init(other)
+    assert store.counters(other)["packets_deduplicated"] == 0
+    assert store.counters(other)["packets_pruned_total"] == 0
+
+    # Re-initialising a file is not a reset: the totals stand, per file.
     store.insert_packet(other, packet)
     store.insert_packet(other, packet)  # +1 duplicate
-    assert store.counters()["packets_deduplicated"] == 1
+    assert store.counters(other)["packets_deduplicated"] == 1
     store.init(other)
-    assert store.counters()["packets_deduplicated"] == 1
+    assert store.counters(other)["packets_deduplicated"] == 1
+    assert store.counters(settings.db_file)["packets_deduplicated"] == 1

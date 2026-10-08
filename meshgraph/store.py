@@ -20,7 +20,6 @@ from .decoder import DecodedPacket
 logger = logging.getLogger(__name__)
 
 _lock = threading.RLock()
-_initialized_for: str | None = None
 
 # Sliding window for reception deduplication: a redelivery of the same radio
 # packet (broker QoS retry, reconnect replay) arrives seconds to minutes
@@ -30,29 +29,43 @@ DEDUP_WINDOW_SECONDS = 600.0
 
 # Data generation for external caches (the graph cache keys off it): every
 # committed change to packets bumps it, so readers spot staleness immediately
-# instead of waiting for a TTL.
-_generation = 0
+# instead of waiting for a TTL.  Both maps are keyed by database file: with
+# several servers collecting in parallel, one server's traffic must not
+# invalidate another server's cache or inflate the stats shown for it.
+_generation: dict[str, int] = {}
 
-# Process-lifetime totals surfaced in /api/graph stats (G-P2-1).
-_counters = {"packets_deduplicated": 0, "packets_pruned_total": 0}
+# Process-lifetime totals surfaced in /api/graph stats (G-P2-1), per database.
+_DEFAULT_COUNTERS = {"packets_deduplicated": 0, "packets_pruned_total": 0}
+_counters: dict[str, dict[str, int]] = {}
+
+# Files whose schema was created in this process (logging only — the schema
+# itself is re-applied on every init, so a file deleted behind our back still
+# gets rebuilt).
+_seen_files: set[str] = set()
 
 
-def counters() -> dict[str, int]:
-    """Totals since this process started; safe to call from any thread."""
+def counters(db_file: str) -> dict[str, int]:
+    """Totals since this process started for one database; safe from any thread."""
     with _lock:
-        return dict(_counters)
+        return dict(_counters.get(db_file, _DEFAULT_COUNTERS))
 
 
-def generation() -> int:
-    """Packet-data generation; bumps on every committed insert or prune."""
+def generation(db_file: str) -> int:
+    """Packet-data generation of one database; bumps on insert or prune."""
     with _lock:
-        return _generation
+        return _generation.get(db_file, 0)
 
 
-def _bump_generation() -> None:
-    """Mark packet data as changed (call while holding ``_lock``)."""
-    global _generation
-    _generation += 1
+def _bump_generation(db_file: str) -> None:
+    """Mark one database's packet data as changed (call while holding ``_lock``)."""
+    _generation[db_file] = _generation.get(db_file, 0) + 1
+
+
+def _counter(db_file: str, key: str) -> int:
+    """Bump one process-lifetime total (call while holding ``_lock``)."""
+    bucket = _counters.setdefault(db_file, dict(_DEFAULT_COUNTERS))
+    bucket[key] += 1
+    return bucket[key]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS packets (
@@ -166,7 +179,7 @@ def _connect(db_file: str) -> sqlite3.Connection:
 
 def init(db_file: str) -> None:
     """Create the schema (idempotent)."""
-    global _initialized_for
+    global _seen_files
     with _lock:
         conn = _connect(db_file)
         try:
@@ -175,13 +188,8 @@ def init(db_file: str) -> None:
             conn.commit()
         finally:
             conn.close()
-        if _initialized_for != db_file:
-            _initialized_for = db_file
-            # Process-lifetime counters feed /api/graph stats: after a
-            # connection switch they must describe the database now on
-            # screen, not the one we came from.
-            _counters["packets_deduplicated"] = 0
-            _counters["packets_pruned_total"] = 0
+        if db_file not in _seen_files:
+            _seen_files.add(db_file)
             logger.info("Database ready: %s", db_file)
 
 
@@ -262,7 +270,7 @@ def insert_packet(db_file: str, packet: DecodedPacket) -> bool:
         conn = _connect(db_file)
         try:
             if _is_duplicate_reception(conn, packet):
-                _counters["packets_deduplicated"] += 1
+                _counter(db_file, "packets_deduplicated")
                 return False
             row = packet.to_row()
             row["processed"] = 1 if packet.processed else 0
@@ -312,7 +320,7 @@ def insert_packet(db_file: str, packet: DecodedPacket) -> bool:
                 )
 
             conn.commit()
-            _bump_generation()
+            _bump_generation(db_file)
             return True
         finally:
             conn.close()
@@ -352,8 +360,9 @@ def prune(db_file: str, retention_hours: int) -> int:
                 )
             conn.commit()
             if deleted:
-                _counters["packets_pruned_total"] += deleted
-                _bump_generation()
+                bucket = _counters.setdefault(db_file, dict(_DEFAULT_COUNTERS))
+                bucket["packets_pruned_total"] += deleted
+                _bump_generation(db_file)
                 logger.info("Pruned %s packets older than %sh", deleted, retention_hours)
             return deleted
         finally:

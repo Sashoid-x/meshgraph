@@ -782,7 +782,7 @@ def build_graph(
             str(limit),
             # Changed data (new packet, prune) means a new key: fresh rows
             # become visible immediately, without waiting for the TTL.
-            str(store.generation()),
+            str(store.generation(settings.db_file)),
         ]
     )
 
@@ -805,7 +805,7 @@ def build_graph(
         payload["stats"]["cache_hits"] = _cache_stats["hits"]
         payload["stats"]["cache_misses"] = _cache_stats["misses"]
         payload["stats"]["snr_scope"] = "both"
-        payload["stats"].update(store.counters())
+        payload["stats"].update(store.counters(settings.db_file))
         return payload
 
     if not use_cache:

@@ -271,9 +271,9 @@ def test_stop_during_connect_leaves_no_orphan_client(settings_store, tmp_path):
     with worker._lock:
         worker._running = True
 
-    replacer = threading.Thread(
-        target=worker._replace_client, args=(settings_store.get(),)
-    )
+    settings = settings_store.get()
+    pid = settings.active_connection
+    replacer = threading.Thread(target=worker._build_link, args=(pid, settings))
     replacer.start()
     deadline = time.time() + 5
     while not made and time.time() < deadline:
@@ -292,24 +292,25 @@ def test_stop_during_connect_leaves_no_orphan_client(settings_store, tmp_path):
     assert not replacer.is_alive() and not stopper.is_alive()
     assert client.disconnected
     assert client.loop_running is False  # loop_stop сработал ПОСЛЕ loop_start
-    assert worker._client is None
+    assert pid not in worker._links  # stop() выпустила и клиента, и ссылку
 
 
-def test_replace_client_closes_the_previous_client(settings_store, tmp_path):
+def test_rebuild_link_closes_the_previous_client(settings_store, tmp_path):
     settings_store.update(db_file=str(tmp_path / "w.db"))
     made: list[FakeClient] = []
     worker = _worker(settings_store, fake_factory(made))
     with worker._lock:
         worker._running = True
     settings = settings_store.get()
+    pid = settings.active_connection
 
-    worker._replace_client(settings)
-    worker._replace_client(settings)
+    worker._build_link(pid, settings)
+    worker._build_link(pid, settings)
 
     assert len(made) == 2
     assert made[0].disconnected and made[0].loop_running is False
     assert made[1].loop_running is True  # новый клиент уже работает
-    assert worker._client is made[1]
+    assert worker._links[pid].client is made[1]
 
 
 def test_record_error_counts_only_new_failures(settings_store, tmp_path):
@@ -373,12 +374,13 @@ def test_tls_failure_lands_in_last_error(settings_store, tmp_path):
     with worker._lock:
         worker._running = True
 
-    worker._replace_client(candidate)
+    worker._build_link(candidate.active_connection, candidate)
 
     stats = worker.status()["stats"]
     assert stats["errors"] == 1
     assert stats["last_error"].startswith("TLS setup failed")
-    assert worker._client is None
+    # Ссылка есть (менеджер показывает ошибку сервера), но клиента нет.
+    assert worker._links[candidate.active_connection].client is None
 
 
 def test_connect_failure_lands_in_last_error(settings_store, tmp_path):
@@ -387,7 +389,8 @@ def test_connect_failure_lands_in_last_error(settings_store, tmp_path):
     with worker._lock:
         worker._running = True
 
-    worker._replace_client(settings_store.get())
+    settings = settings_store.get()
+    worker._build_link(settings.active_connection, settings)
 
     stats = worker.status()["stats"]
     assert stats["errors"] == 1
@@ -496,7 +499,7 @@ def test_full_inbox_drops_the_oldest_without_blocking(
     stats = worker.status()["stats"]
     assert stats["messages"] == 2
     assert stats["dropped_queue"] == 1
-    topic, _payload, _settings = worker._inbox.get_nowait()
+    _pid, topic, _payload, _settings = worker._inbox.get_nowait()
     assert topic == "second"  # вытеснен старый пакет, свежий остался
 
 
@@ -578,3 +581,169 @@ def test_safe_db_stats_reports_counts_and_survives_a_broken_path(
     # Нечитаемая база (каталог вместо файла) — ошибка, а не исключение.
     bad = mqtt_worker._safe_db_stats(str(tmp_path))
     assert "error" in bad
+
+
+# ---------------------------------------------------------------------------
+# Connection manager: one client per enabled server (Variant A)
+# ---------------------------------------------------------------------------
+
+
+def _add_second_connection(settings_store) -> str:
+    """Второй профиль (свой топик → своя база); делается активным."""
+    return settings_store.add_connection(
+        connection_name="Другой",
+        mqtt_topic_prefix="other",
+        mqtt_topic_suffix="/#",
+    ).active_connection
+
+
+def _other_pid(settings_store, second_pid: str) -> str:
+    return next(
+        p["id"] for p in settings_store.get().connections if p["id"] != second_pid
+    )
+
+
+def test_every_enabled_profile_gets_its_own_client(settings_store, tmp_path):
+    settings_store.update(db_file=str(tmp_path / "one.db"))
+    second_pid = _add_second_connection(settings_store)
+    first_pid = _other_pid(settings_store, second_pid)
+
+    made: list[FakeClient] = []
+    worker = _worker(settings_store, fake_factory(made))
+    worker.start()
+    try:
+        deadline = time.time() + 5
+        while len(made) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert {c.kwargs["userdata"] for c in made} == {first_pid, second_pid}
+        assert set(worker._links) == {first_pid, second_pid}
+        # Каждый клиент несёт свой топик — подписки не пересекаются.
+        assert (
+            worker._links[first_pid].settings.subscribe_topic
+            != worker._links[second_pid].settings.subscribe_topic
+        )
+    finally:
+        worker.stop()
+
+
+def test_disabled_profile_gets_no_client(settings_store, tmp_path):
+    settings_store.update(db_file=str(tmp_path / "one.db"))
+    second_pid = _add_second_connection(settings_store)
+    settings_store.set_connection_enabled(second_pid, False)
+    first_pid = settings_store.get().active_connection
+
+    made: list[FakeClient] = []
+    worker = _worker(settings_store, fake_factory(made))
+    worker.start()
+    try:
+        deadline = time.time() + 5
+        while not made and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.6)  # второй тик супервайзера: больше клиентов не ждём
+        assert [c.kwargs["userdata"] for c in made] == [first_pid]
+        assert set(worker._links) == {first_pid}
+    finally:
+        worker.stop()
+
+
+def test_disabling_a_connection_releases_its_client(settings_store, tmp_path):
+    settings_store.update(db_file=str(tmp_path / "one.db"))
+    second_pid = _add_second_connection(settings_store)
+
+    made: list[FakeClient] = []
+    worker = _worker(settings_store, fake_factory(made))
+    worker.start()
+    try:
+        deadline = time.time() + 5
+        while len(made) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert second_pid in worker._links
+
+        settings_store.set_connection_enabled(second_pid, False)
+
+        deadline = time.time() + 5
+        while second_pid in worker._links and time.time() < deadline:
+            time.sleep(0.01)
+        assert second_pid not in worker._links
+        released = [c for c in made if c.kwargs["userdata"] == second_pid]
+        assert released and all(c.disconnected for c in released)
+    finally:
+        worker.stop()
+
+
+def test_status_lists_every_connection_with_its_state(settings_store, tmp_path):
+    settings_store.update(db_file=str(tmp_path / "one.db"))
+    second_pid = _add_second_connection(settings_store)
+    worker = _worker(settings_store)
+
+    status = worker.status()
+    ids = {c["id"] for c in status["connections"]}
+    assert ids == {second_pid, _other_pid(settings_store, second_pid)}
+
+    active = next(c for c in status["connections"] if c["active"])
+    assert active["id"] == settings_store.get().active_connection
+    assert active["connected"] is False  # клиентов ещё не было
+    assert all(c["enabled"] for c in status["connections"])
+
+
+def test_background_server_writes_into_its_own_database(
+    settings_store, tmp_path, monkeypatch
+):
+    """Пакет фонового сервера уходит в ЕГО базу и не трогает счётчики активного."""
+    settings_store.update(db_file=str(tmp_path / "active.db"))
+    second_pid = _add_second_connection(settings_store)
+    first_pid = _other_pid(settings_store, second_pid)
+    settings_store.select_connection(first_pid)  # активный — первый
+    store.ensure_ready(settings_store.get())
+
+    worker = _worker(settings_store)
+    with worker._lock:
+        worker._running = True
+    worker._build_link(second_pid, worker._snapshots[second_pid])
+    monkeypatch.setattr(
+        mqtt_worker,
+        "decode_message",
+        lambda topic, payload, keys: make_packet(mesh_packet_id=7),
+    )
+
+    worker._on_message(
+        None, second_pid, SimpleNamespace(topic="other/1/2/3/x", payload=b"x")
+    )
+    pid, topic, payload, snapshot = worker._inbox.get_nowait()
+    assert pid == second_pid
+    assert snapshot.db_file != settings_store.get().db_file
+
+    worker._process_message(topic, payload, snapshot, worker._links[pid])
+
+    assert store.stats(snapshot.db_file)["packets"] == 1
+    assert store.stats(settings_store.get().db_file)["packets"] == 0
+    # Счётчики активного не задеты; decoded записан на ссылку фонового сервера.
+    assert worker.status()["stats"]["decoded"] == 0
+    assert worker._links[second_pid].stats["decoded"] == 1
+
+
+def test_background_prune_failure_is_attributed_to_that_server(
+    settings_store, tmp_path, monkeypatch
+):
+    settings_store.update(retention_hours=1, db_file=str(tmp_path / "one.db"))
+    second_pid = _add_second_connection(settings_store)
+    first_pid = _other_pid(settings_store, second_pid)
+    settings_store.select_connection(first_pid)
+
+    worker = _worker(settings_store)
+    with worker._lock:
+        worker._running = True
+    worker._build_link(second_pid, worker._snapshots[second_pid])
+
+    def boom(db_file, hours):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(mqtt_worker.store, "prune", boom)
+    worker._prune_if_due(worker._snapshots[second_pid], second_pid)
+
+    link = worker._links[second_pid]
+    assert link.stats["errors"] == 1
+    assert "prune failed" in link.stats["last_error"]
+    # Активный сервер тут ни при чём: его статистика чиста.
+    assert worker.status()["stats"]["errors"] == 0

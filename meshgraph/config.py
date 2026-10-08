@@ -7,6 +7,8 @@ the capture worker and the web UI always read the same source of truth.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import base64
@@ -22,6 +24,38 @@ import yaml
 from .crypto import MAX_PSK_BYTES, MESHTASTIC_DEFAULT_PSK
 
 logger = logging.getLogger(__name__)
+
+# Settings-password hashing: PBKDF2-HMAC-SHA256, salted per password.  The
+# plaintext never touches disk — only this encoded form lives in config.yaml.
+PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password: str) -> str:
+    """Encode a settings password as ``pbkdf2$iterations$salt$digest``."""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS
+    )
+    return f"pbkdf2${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def check_password(password: str, encoded: str) -> bool:
+    """Constant-time verification; a malformed stored value never matches."""
+    try:
+        algorithm, iterations, salt_hex, digest_hex = str(encoded).split("$", 3)
+        if algorithm != "pbkdf2":
+            return False
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+        rounds = int(iterations)
+        if rounds < 1:
+            return False
+    except (ValueError, TypeError):
+        return False
+    candidate = hashlib.pbkdf2_hmac(
+        "sha256", str(password).encode("utf-8"), salt, rounds
+    )
+    return hmac.compare_digest(candidate, expected)
 
 # Default Meshtastic LongFast channel key (base64).  Traceroute packets on the
 # default channel are encrypted with it, so a graph built without any key would
@@ -75,6 +109,11 @@ class Settings:
     # --- Web UI ----------------------------------------------------------
     web_host: str = "127.0.0.1"
     web_port: int = 5010
+    # Password guarding the settings dialog and connection management — no
+    # login, just this.  "" leaves the settings open (set the first password
+    # from the dialog's «Безопасность» section); only the hash is stored —
+    # see hash_password / check_password.
+    settings_password_hash: str = ""
 
     # --- Defaults for the graph page -------------------------------------
     default_graph_mode: str = "traceroute"
@@ -105,6 +144,9 @@ class Settings:
     def masked(self) -> dict[str, Any]:
         """Serializable copy with the broker password replaced by a mask."""
         data = asdict(self)
+        # The settings password never leaves the process: only its presence.
+        stored_hash = str(data.pop("settings_password_hash", "") or "")
+        data["settings_password_set"] = bool(stored_hash)
         # Profiles are exposed as an index only: GET /api/settings must not
         # leak the other servers' passwords or channel keys.
         data["connections"] = [
@@ -113,6 +155,9 @@ class Settings:
                 "name": p.get("name"),
                 "broker": p.get("mqtt_broker_address"),
                 "port": p.get("mqtt_port"),
+                "topic": f"{p.get('mqtt_topic_prefix') or ''}"
+                f"{p.get('mqtt_topic_suffix') or ''}",
+                "enabled": _coerce_enabled(p.get("enabled", True)),
                 "db_file": p.get("db_file"),
             }
             for p in self.connections
@@ -129,6 +174,13 @@ class Settings:
 # ---------------------------------------------------------------------------
 # Connection profile helpers
 # ---------------------------------------------------------------------------
+
+def _coerce_enabled(value: Any) -> bool:
+    """Checkbox-style truthiness: strings arrive from YAML and hand edits."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
 
 def _slug(text: Any) -> str:
     """Lowercase ASCII slug — connection ids double as database file names."""
@@ -197,6 +249,7 @@ def _profile_from_flat(
     for fname in PROFILE_FIELDS:
         profile[fname] = getattr(settings, fname)
     profile["db_file"] = db_file
+    profile["enabled"] = True  # a new server starts collecting right away
     return profile
 
 
@@ -216,6 +269,32 @@ def _apply_profile(settings: Settings, profile: dict[str, Any]) -> None:
     if profile.get("db_file"):
         settings.db_file = str(profile["db_file"])
     settings.connection_name = str(profile.get("name") or "")
+
+
+def profile_settings(settings: Settings, profile: dict[str, Any]) -> Settings:
+    """A flat Settings view pointing at one profile.
+
+    The capture worker keeps one such snapshot per enabled server: every
+    connection subscribes with its own topic, keys and database file while
+    global preferences (retention, graph defaults) stay shared.
+    """
+    snapshot = deepcopy(settings)
+    _apply_profile(snapshot, profile)
+    snapshot.active_connection = str(profile.get("id") or "")
+    return snapshot
+
+
+def enabled_snapshots(settings: Settings) -> dict[str, Settings]:
+    """One flat Settings snapshot per *enabled* connection, keyed by id.
+
+    This is the worker's desired state: disabled servers get no client and
+    collect nothing until switched back on.
+    """
+    return {
+        str(p.get("id") or ""): profile_settings(settings, p)
+        for p in settings.connections
+        if isinstance(p, dict) and _coerce_enabled(p.get("enabled", True))
+    }
 
 
 def _absorb_flat(settings: Settings, profile: dict[str, Any]) -> None:
@@ -291,6 +370,7 @@ def _normalize_profiles(raw: Any) -> list[dict[str, Any]]:
                 f"{profile.get('mqtt_topic_prefix') or ''}"
                 f"{profile.get('mqtt_topic_suffix') or ''}",
             )
+        profile["enabled"] = _coerce_enabled(profile.get("enabled", True))
     return profiles
 
 
@@ -538,6 +618,9 @@ class SettingsStore:
         unknown = set(changes) - known
         if unknown:
             raise ValueError(f"Unknown settings: {', '.join(sorted(unknown))}")
+        if "settings_password_hash" in changes:
+            # The hash is managed through set_password(), never written raw.
+            raise ValueError("settings_password_hash is managed via set_password().")
 
         # Switching the active connection comes first: connection fields sent
         # in the same call then apply on top of the profile switched to.
@@ -734,6 +817,70 @@ class SettingsStore:
         self.save(current)
         return current
 
+    def get_connection(self, pid: str) -> dict[str, Any] | None:
+        """A copy of the registry entry for ``pid`` (None when unknown)."""
+        wanted = str(pid)
+        for profile in self.get().connections:
+            if str(profile.get("id") or "") == wanted:
+                return profile
+        return None
+
+    def set_connection_enabled(self, pid: str, enabled: bool) -> Settings:
+        """Turn one server's collection on or off.
+
+        Disabling the active connection moves the view to the first other
+        enabled one; with everything disabled the view stays put — its
+        history remains readable, it simply stops receiving anything new.
+        Disabled servers are dropped by the worker and hidden from the
+        unauthenticated switcher.
+        """
+        current = self.get()
+        profile = next(
+            (p for p in current.connections if str(p.get("id") or "") == str(pid)),
+            None,
+        )
+        if profile is None:
+            raise ValueError(f"Unknown connection: {pid}")
+        wanted = _coerce_enabled(enabled)
+        if _coerce_enabled(profile.get("enabled", True)) == wanted:
+            return current
+        profile["enabled"] = wanted
+        if not wanted and str(pid) == str(current.active_connection):
+            fallback = next(
+                (
+                    p
+                    for p in current.connections
+                    if str(p.get("id") or "") != str(pid)
+                    and _coerce_enabled(p.get("enabled", True))
+                ),
+                None,
+            )
+            if fallback is not None:
+                self._switch_to(current, str(fallback["id"]))
+        self.save(current)
+        return current
+
+    def set_password(self, new_password: str, current_password: str | None = None) -> Settings:
+        """Set, replace or clear (empty string) the settings password.
+
+        While a password is set, changing or removing it requires the old
+        one in ``current_password``; the first password does not.
+        """
+        current = self.get()
+        if current.settings_password_hash and not check_password(
+            str(current_password or ""), current.settings_password_hash
+        ):
+            raise ValueError("Current password is incorrect.")
+        new_password = str(new_password or "")
+        if new_password:
+            if len(new_password) < 4:
+                raise ValueError("Password must be at least 4 characters.")
+            current.settings_password_hash = hash_password(new_password)
+        else:
+            current.settings_password_hash = ""
+        self.save(current)
+        return current
+
     def remove_connection(self, pid: str) -> Settings:
         """Forget a profile; the active one falls back to the next remaining.
 
@@ -751,8 +898,14 @@ class SettingsStore:
             p for p in current.connections if str(p.get("id") or "") != pid
         ]
         if pid == current.active_connection:
-            remaining = [str(p.get("id") or "") for p in current.connections]
-            self._switch_to(current, remaining[0])
+            # Prefer an enabled server for the view; if everything left is
+            # disabled, fall back to the first one anyway.
+            remaining = current.connections
+            fallback = next(
+                (p for p in remaining if _coerce_enabled(p.get("enabled", True))),
+                remaining[0],
+            )
+            self._switch_to(current, str(fallback["id"]))
         self.save(current)
         return current
 

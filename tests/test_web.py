@@ -466,7 +466,18 @@ def test_settings_lists_every_connection(client):
     assert payload["active_connection"] == payload["connections"][0]["id"]
     # The index is just an index: no secrets of any profile.
     for profile in payload["connections"]:
-        assert set(profile) == {"id", "name", "broker", "port", "db_file"}
+        assert set(profile) == {
+            "id",
+            "name",
+            "broker",
+            "port",
+            "topic",
+            "enabled",
+            "db_file",
+        }
+    # The settings password never leaves the process — only its presence.
+    assert "settings_password_hash" not in payload
+    assert payload["settings_password_set"] is False
 
 
 def test_create_connection_switches_to_its_own_empty_graph(client):
@@ -576,3 +587,177 @@ def test_settings_mask_other_profile_passwords(client):
     for profile in payload["connections"]:
         assert "mqtt_password" not in profile
     assert "s3cret" not in str(payload["connections"])
+
+
+# ---------------------------------------------------------------------------
+# Settings password, manager API and the public switcher
+# ---------------------------------------------------------------------------
+
+
+def _store(client):
+    return client.application.extensions["meshgraph_settings"]
+
+
+def test_settings_and_manager_endpoints_require_the_password(client):
+    _store(client).set_password("sekret")
+    headers = {"X-Settings-Password": "sekret"}
+
+    assert client.get("/api/settings").status_code == 401
+    assert client.get("/api/settings", headers=headers).status_code == 200
+
+    assert client.post("/api/settings", json={}).status_code == 401
+    assert client.post("/api/settings", json={}, headers=headers).status_code == 200
+
+    assert client.post("/api/settings/validate", json={}).status_code == 401
+    assert client.post("/api/connections", json={}).status_code == 401
+
+    pid = _store(client).get().active_connection
+    assert (
+        client.post(f"/api/connections/{pid}", json={"enabled": True}).status_code
+        == 401
+    )
+    assert client.delete(f"/api/connections/{pid}").status_code == 401
+    assert (
+        client.post("/api/settings/password", json={"password": "x2xx"}).status_code
+        == 401
+    )
+
+    # Неверный пароль — тоже отказ.
+    wrong = client.get("/api/settings", headers={"X-Settings-Password": "nope"})
+    assert wrong.status_code == 401
+    assert wrong.get_json()["auth"] == "password"
+
+
+def test_switching_between_enabled_servers_stays_public(client):
+    _store(client).set_password("sekret")
+    pid = _store(client).get().active_connection
+
+    # Включённое подключение переключается и без пароля: шапочный
+    # селектор работает для всех, кто открыл страницу.
+    ok = client.post("/api/connections/select", json={"id": pid})
+    assert ok.status_code == 200
+    assert ok.get_json()["ok"] is True
+
+
+def test_disabled_connection_needs_the_settings_password(client):
+    store = _store(client)
+    store.set_password("sekret")
+    pid = store.get().active_connection
+    store.set_connection_enabled(pid, False)
+
+    denied = client.post("/api/connections/select", json={"id": pid})
+    assert denied.status_code == 403
+    assert denied.get_json()["auth"] == "password"
+
+    allowed = client.post(
+        "/api/connections/select",
+        json={"id": pid},
+        headers={"X-Settings-Password": "sekret"},
+    )
+    assert allowed.status_code == 200
+
+    # Неизвестный id — по-прежнему 400, какой бы пароль ни подставили.
+    unknown = client.post(
+        "/api/connections/select",
+        json={"id": "ghost"},
+        headers={"X-Settings-Password": "sekret"},
+    )
+    assert unknown.status_code == 400
+
+
+def test_connection_toggle_endpoint_moves_the_view(client):
+    store = _store(client)
+    first = store.get().active_connection
+    second = store.add_connection(
+        connection_name="Другой",
+        mqtt_topic_prefix="other",
+        mqtt_topic_suffix="/#",
+    ).active_connection
+
+    # Выключили активный → вид переходит на первый включённый.
+    turned = client.post(f"/api/connections/{second}", json={"enabled": False})
+    assert turned.status_code == 200
+    settings = turned.get_json()["settings"]
+    assert settings["active_connection"] == first
+    toggled = next(p for p in settings["connections"] if p["id"] == second)
+    assert toggled["enabled"] is False
+
+    # Включили обратно — без смены активного.
+    turned = client.post(f"/api/connections/{second}", json={"enabled": True})
+    assert turned.status_code == 200
+    settings = turned.get_json()["settings"]
+    assert settings["active_connection"] == first
+    toggled = next(p for p in settings["connections"] if p["id"] == second)
+    assert toggled["enabled"] is True
+
+    # Без поля enabled — 400; неизвестный id — 400.
+    assert client.post(f"/api/connections/{second}", json={}).status_code == 400
+    assert client.post("/api/connections/ghost", json={"enabled": True}).status_code == 400
+
+
+def test_password_endpoint_set_change_clear(client):
+    # Первый пароль — без старого.
+    first = client.post("/api/settings/password", json={"password": "one1"})
+    assert first.status_code == 200
+    assert first.get_json()["settings"]["settings_password_set"] is True
+    assert client.get("/api/settings").status_code == 401
+
+    # Смена требует действующий пароль — без него отказ.
+    assert (
+        client.post("/api/settings/password", json={"password": "two2"}).status_code
+        == 401
+    )
+    changed = client.post(
+        "/api/settings/password",
+        json={"password": "two2"},
+        headers={"X-Settings-Password": "one1"},
+    )
+    assert changed.status_code == 200
+    assert (
+        client.get("/api/settings", headers={"X-Settings-Password": "one1"}).status_code
+        == 401
+    )
+    assert (
+        client.get("/api/settings", headers={"X-Settings-Password": "two2"}).status_code
+        == 200
+    )
+
+    # Слишком короткий — 400 с подсказкой.
+    short = client.post(
+        "/api/settings/password",
+        json={"password": "ab"},
+        headers={"X-Settings-Password": "two2"},
+    )
+    assert short.status_code == 400
+
+    # Снятие возвращает открытые настройки.
+    cleared = client.post(
+        "/api/settings/password",
+        json={"password": ""},
+        headers={"X-Settings-Password": "two2"},
+    )
+    assert cleared.status_code == 200
+    assert cleared.get_json()["settings"]["settings_password_set"] is False
+    assert client.get("/api/settings").status_code == 200
+
+
+def test_status_lists_every_server_for_the_public_switcher(client):
+    store = _store(client)
+    store.add_connection(
+        connection_name="Другой",
+        mqtt_topic_prefix="other",
+        mqtt_topic_suffix="/#",
+    )
+
+    status = client.get("/api/status").get_json()
+    connections = status["connections"]
+    assert len(connections) == 2
+
+    active = next(c for c in connections if c["id"] == status["connection"]["id"])
+    assert active["active"] is True
+    assert active["enabled"] is True
+    assert set(active) >= {
+        "id", "name", "broker", "topic",
+        "enabled", "active", "connected", "error", "messages",
+    }
+    assert all(c["topic"] for c in connections)

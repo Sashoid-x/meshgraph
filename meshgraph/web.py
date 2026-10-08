@@ -10,12 +10,25 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template, request
 
 from . import __version__, chat, graph, store
-from .config import GRAPH_MODES, Settings, SettingsStore, get_settings_store, validate
+from .config import (
+    GRAPH_MODES,
+    Settings,
+    SettingsStore,
+    _coerce_enabled,
+    check_password,
+    enabled_snapshots,
+    get_settings_store,
+    validate,
+)
 from .mqtt_worker import CaptureWorker
 
 logger = logging.getLogger(__name__)
 
 PACKAGE_DIR = Path(__file__).resolve().parent
+
+# Wrong settings-password attempts cost this much wall time (brute-force
+# damping on an otherwise unauthenticated LAN UI).
+PASSWORD_DELAY_SECONDS = 0.25
 
 
 def create_app(
@@ -24,6 +37,11 @@ def create_app(
     store_ref = settings_store or get_settings_store()
     settings = store_ref.get()
     store.ensure_ready(settings)
+    # Every enabled server's database exists before anyone can switch to it
+    # (the worker re-ensures this on each reconcile, but the UI may be
+    # faster than the supervisor's first tick).
+    for snapshot in enabled_snapshots(settings).values():
+        store.ensure_ready(snapshot)
 
     app = Flask(
         __name__,
@@ -37,6 +55,29 @@ def create_app(
         worker.start()
     app.extensions["meshgraph_worker"] = worker
     app.extensions["meshgraph_settings"] = store_ref
+
+    # ------------------------------------------------------------------
+    # Settings password (no login: one password guards the dialog)
+    # ------------------------------------------------------------------
+
+    def settings_authorized() -> bool:
+        """No password configured ⇒ everything is open (first-run setup)."""
+        stored = store_ref.get().settings_password_hash
+        if not stored:
+            return True
+        return check_password(request.headers.get("X-Settings-Password", ""), stored)
+
+    def auth_denied():
+        """None when allowed; a 401 JSON body when the password is missing/wrong."""
+        if settings_authorized():
+            return None
+        time.sleep(PASSWORD_DELAY_SECONDS)
+        return (
+            jsonify(
+                {"ok": False, "auth": "password", "errors": ["Wrong password."]}
+            ),
+            401,
+        )
 
     # ------------------------------------------------------------------
     # Pages
@@ -113,10 +154,16 @@ def create_app(
 
     @app.get("/api/settings")
     def api_settings_get():
+        denied = auth_denied()
+        if denied:
+            return denied
         return jsonify(store_ref.get().masked())
 
     @app.post("/api/settings")
     def api_settings_post():
+        denied = auth_denied()
+        if denied:
+            return denied
         body = request.get_json(silent=True) or {}
         if not isinstance(body, dict):
             return jsonify({"ok": False, "errors": ["Expected a JSON object."]}), 400
@@ -156,6 +203,9 @@ def create_app(
 
     @app.post("/api/settings/validate")
     def api_settings_validate():
+        denied = auth_denied()
+        if denied:
+            return denied
         body = request.get_json(silent=True) or {}
         candidate = store_ref.get()
         for key, value in body.items():
@@ -164,12 +214,47 @@ def create_app(
         errors = validate(candidate)
         return jsonify({"ok": not errors, "errors": errors})
 
+    @app.post("/api/settings/password")
+    def api_settings_password():
+        """Set, change or clear (empty) the settings password."""
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "errors": ["Expected a JSON object."]}), 400
+        provided = request.headers.get("X-Settings-Password", "") or str(
+            body.get("current_password") or ""
+        )
+        try:
+            # set_password re-verifies ``provided`` when a password exists;
+            # the first password needs no old one.
+            updated = store_ref.set_password(
+                str(body.get("password") or ""), current_password=provided
+            )
+        except ValueError as exc:
+            stored = store_ref.get().settings_password_hash
+            if stored and not check_password(provided, stored):
+                time.sleep(PASSWORD_DELAY_SECONDS)
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "auth": "password",
+                            "errors": ["Wrong password."],
+                        }
+                    ),
+                    401,
+                )
+            return jsonify({"ok": False, "errors": str(exc).split("; ")}), 400
+        return jsonify({"ok": True, "settings": updated.masked()})
+
     # ------------------------------------------------------------------
     # Connections (one server — one database file)
     # ------------------------------------------------------------------
 
     @app.post("/api/connections")
     def api_connections_create():
+        denied = auth_denied()
+        if denied:
+            return denied
         body = request.get_json(silent=True) or {}
         if not isinstance(body, dict):
             return jsonify({"ok": False, "errors": ["Expected a JSON object."]}), 400
@@ -187,6 +272,35 @@ def create_app(
         pid = body.get("id") if isinstance(body, dict) else None
         if not pid:
             return jsonify({"ok": False, "errors": ["Connection id is required."]}), 400
+        current = store_ref.get()
+        profile = next(
+            (p for p in current.connections if str(p.get("id") or "") == str(pid)),
+            None,
+        )
+        if profile is None:
+            return (
+                jsonify({"ok": False, "errors": [f"Unknown connection: {pid}"]}),
+                400,
+            )
+        # Switching is deliberately public: the header dropdown lets anyone
+        # move between *enabled* servers without the settings password.
+        # Reaching a disabled profile (to edit it) requires unlocking.
+        if not settings_authorized() and not _coerce_enabled(
+            profile.get("enabled", True)
+        ):
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "auth": "password",
+                        "errors": [
+                            f"Connection `{pid}` is disabled — unlock the "
+                            "settings to select it."
+                        ],
+                    }
+                ),
+                403,
+            )
         try:
             selected = store_ref.select_connection(str(pid))
         except ValueError as exc:
@@ -195,8 +309,30 @@ def create_app(
         graph.invalidate_cache()
         return jsonify({"ok": True, "settings": selected.masked()})
 
+    @app.post("/api/connections/<pid>")
+    def api_connections_toggle(pid: str):
+        """Enable/disable one server's collection (manager list)."""
+        denied = auth_denied()
+        if denied:
+            return denied
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict) or "enabled" not in body:
+            return (
+                jsonify({"ok": False, "errors": ["`enabled` is required."]}),
+                400,
+            )
+        try:
+            updated = store_ref.set_connection_enabled(pid, body["enabled"])
+        except ValueError as exc:
+            return jsonify({"ok": False, "errors": str(exc).split("; ")}), 400
+        graph.invalidate_cache()
+        return jsonify({"ok": True, "settings": updated.masked()})
+
     @app.delete("/api/connections/<pid>")
     def api_connections_delete(pid: str):
+        denied = auth_denied()
+        if denied:
+            return denied
         try:
             remaining = store_ref.remove_connection(pid)
         except ValueError as exc:

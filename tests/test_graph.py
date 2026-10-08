@@ -638,7 +638,7 @@ def test_insert_invalidates_cached_payload_immediately(settings):
 
     # A redelivered duplicate stores no row — the generation must not move,
     # otherwise every retry would needlessly invalidate the cache.
-    generation = store.generation()
+    generation = store.generation(settings.db_file)
     store.insert_packet(
         settings.db_file,
         make_packet(
@@ -650,7 +650,7 @@ def test_insert_invalidates_cached_payload_immediately(settings):
             mesh_packet_id=5,  # the same packet that already sits in the table
         ),
     )
-    assert store.generation() == generation
+    assert store.generation(settings.db_file) == generation
 
     # Unchanged data → same key → the cached object is served again.
     third = graph.build_graph(settings, mode="traceroute", use_cache=True)

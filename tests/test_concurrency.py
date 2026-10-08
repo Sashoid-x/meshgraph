@@ -66,7 +66,7 @@ def test_parallel_inserts_and_queries_stay_consistent(settings):
 
 
 def test_stop_is_safe_while_replacing_clients(settings_store, tmp_path):
-    """Гонка stop() ↔ _replace_client: ни исключений, ни поднятых потоков."""
+    """Гонка stop() ↔ _build_link: ни исключений, ни поднятых потоков."""
     settings_store.update(db_file=str(tmp_path / "race.db"))
     store.ensure_ready(settings_store.get())
     worker = mqtt_worker.CaptureWorker(
@@ -75,8 +75,10 @@ def test_stop_is_safe_while_replacing_clients(settings_store, tmp_path):
     worker.start()
 
     def hammer() -> None:
+        settings = settings_store.get()
+        pid = settings.active_connection
         for _ in range(30):
-            worker._replace_client(settings_store.get())
+            worker._build_link(pid, settings)
 
     replacing = threading.Thread(target=hammer, daemon=True)
     replacing.start()
@@ -88,7 +90,7 @@ def test_stop_is_safe_while_replacing_clients(settings_store, tmp_path):
         worker.stop()  # убрать клиента, созданного после основного stop()
 
     assert not replacing.is_alive()
-    assert worker._client is None
+    assert worker._links == {}
     alive = [
         t.name
         for t in threading.enumerate()

@@ -8,7 +8,15 @@ import logging
 import pytest
 import yaml
 
-from meshgraph.config import Settings, SettingsStore, validate
+from meshgraph.config import (
+    Settings,
+    SettingsStore,
+    check_password,
+    enabled_snapshots,
+    hash_password,
+    profile_settings,
+    validate,
+)
 
 
 def test_default_settings_are_valid():
@@ -455,3 +463,172 @@ def test_validate_rejects_profile_without_broker():
     settings.active_connection = "a"
     errors = validate(settings)
     assert any("needs a broker address" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Server manager: the enabled flag, snapshots, fallbacks
+# ---------------------------------------------------------------------------
+
+
+def test_profiles_default_to_enabled(settings_store):
+    """Старый конфиг без ключа enabled читается как включённый сервер."""
+    profiles = settings_store.get().connections
+    assert profiles
+    assert all(p["enabled"] is True for p in profiles)
+
+
+def test_hand_edited_enabled_flag_is_coerced_on_load(tmp_path):
+    """Ручная правка YAML: `off`/`on` превращаются в настоящие булевы."""
+    from dataclasses import asdict
+
+    path = tmp_path / "config.yaml"
+    data = asdict(SettingsStore(path).get())  # дефолт с одним подключением
+
+    data["connections"][0]["enabled"] = "off"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    assert SettingsStore(path).get().connections[0]["enabled"] is False
+
+    data["connections"][0]["enabled"] = "on"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    assert SettingsStore(path).get().connections[0]["enabled"] is True
+
+
+def test_enabled_snapshots_only_include_enabled_servers(settings_store):
+    second = settings_store.add_connection(
+        connection_name="Другой",
+        mqtt_topic_prefix="other",
+        mqtt_topic_suffix="/#",
+    )
+    first_id = [
+        p["id"]
+        for p in settings_store.get().connections
+        if p["id"] != second.active_connection
+    ][0]
+
+    snapshots = enabled_snapshots(settings_store.get())
+    assert set(snapshots) == {first_id, second.active_connection}
+
+    settings_store.set_connection_enabled(second.active_connection, False)
+    snapshots = enabled_snapshots(settings_store.get())
+    assert set(snapshots) == {first_id}
+
+
+def test_profile_settings_snapshot_is_isolated(settings_store):
+    settings_store.update(retention_hours=48)
+    second = settings_store.add_connection(
+        connection_name="Другой",
+        mqtt_topic_prefix="other",
+        mqtt_topic_suffix="/#",
+    )
+    profile = settings_store.get_connection(second.active_connection)
+    snapshot = profile_settings(settings_store.get(), profile)
+
+    # Свойства сервера...
+    assert snapshot.mqtt_topic_prefix == "other"
+    assert snapshot.mqtt_topic_suffix == "/#"
+    assert snapshot.db_file == profile["db_file"]
+    assert snapshot.active_connection == profile["id"]
+    # ...и общие настройки; правка снапшота не трогает хранилище.
+    assert snapshot.retention_hours == 48
+    snapshot.retention_hours = 7
+    assert settings_store.get().retention_hours == 48
+
+
+def test_disabling_the_active_connection_moves_the_view(settings_store):
+    first_id = settings_store.get().active_connection
+    second = settings_store.add_connection(
+        connection_name="Второй", mqtt_topic_prefix="two", mqtt_topic_suffix="/#"
+    )
+    assert second.active_connection != first_id
+
+    settings_store.set_connection_enabled(second.active_connection, False)
+
+    current = settings_store.get()
+    assert current.active_connection == first_id
+    assert current.connections[0]["enabled"] is True
+
+
+def test_disabling_the_last_enabled_keeps_the_view(settings_store):
+    """Выключить всё можно: история активного читается, просто без сбора."""
+    pid = settings_store.get().active_connection
+    settings_store.set_connection_enabled(pid, False)
+
+    current = settings_store.get()
+    assert current.active_connection == pid
+    assert current.connections[0]["enabled"] is False
+
+    # Повторное выключение — бездумный no-op, не ошибка.
+    assert settings_store.set_connection_enabled(pid, False).active_connection == pid
+
+
+def test_unknown_connection_toggle_is_refused(settings_store):
+    with pytest.raises(ValueError, match="Unknown connection"):
+        settings_store.set_connection_enabled("ghost", False)
+
+
+def test_remove_prefers_an_enabled_fallback(settings_store):
+    settings_store.add_connection(connection_name="B", mqtt_topic_prefix="b")
+    settings_store.add_connection(connection_name="C", mqtt_topic_prefix="c")
+    ids = [p["id"] for p in settings_store.get().connections]
+    settings_store.set_connection_enabled(ids[0], False)  # первый выключен
+
+    settings_store.remove_connection(ids[2])  # удаляем активный C
+
+    after = settings_store.get()
+    assert after.active_connection == ids[1]  # включённый, а не первый подряд
+
+
+def test_get_connection_returns_a_copy(settings_store):
+    pid = settings_store.get().active_connection
+    profile = settings_store.get_connection(pid)
+    profile["name"] = "Хак"
+    assert settings_store.get_connection(pid)["name"] != "Хак"
+    assert settings_store.get_connection("ghost") is None
+
+
+# ---------------------------------------------------------------------------
+# Settings password (no login: one password guards the dialog)
+# ---------------------------------------------------------------------------
+
+
+def test_password_hash_roundtrip():
+    encoded = hash_password("секрет")
+    assert encoded.startswith("pbkdf2$")
+    assert check_password("секрет", encoded)
+    assert not check_password("другой", encoded)
+    # Свежая соль на каждый вызов: две строки — разные.
+    assert hash_password("секрет") != encoded
+    # Пусто и битый формат никогда не совпадают.
+    assert not check_password("", "")
+    assert not check_password("x", "garbage")
+    assert not check_password("x", "bcrypt$1$aa$bb")
+
+
+def test_set_password_needs_no_old_one_then_requires_it(settings_store):
+    settings_store.set_password("first-pass")
+    assert check_password("first-pass", settings_store.get().settings_password_hash)
+
+    with pytest.raises(ValueError, match="Current password"):
+        settings_store.set_password("next", current_password="wrong")
+    settings_store.set_password("next", current_password="first-pass")
+    assert check_password("next", settings_store.get().settings_password_hash)
+
+    settings_store.set_password("", current_password="next")  # снятие
+    assert settings_store.get().settings_password_hash == ""
+
+
+def test_settings_password_must_be_long_enough(settings_store):
+    with pytest.raises(ValueError, match="at least 4"):
+        settings_store.set_password("abc")
+
+
+def test_masked_never_exposes_the_hash(settings_store):
+    settings_store.set_password("secret")
+    masked = settings_store.get().masked()
+    assert "settings_password_hash" not in masked
+    assert masked["settings_password_set"] is True
+
+
+def test_update_refuses_raw_password_hash(settings_store):
+    with pytest.raises(ValueError, match="set_password"):
+        settings_store.update(settings_password_hash="pbkdf2$hacked")
