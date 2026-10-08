@@ -19,3 +19,6 @@ web_host: 0.0.0.0
 web_port: 5010
 default_graph_mode: combined
 default_hours: 24
+# settings_password_hash: 'pbkdf2$200000$...' — здесь окажется только хэш
+# пароля на настройки, когда он будет задан установщиком (MESHGRAPH_PASSWORD)
+# или диалогом «Настройки → Безопасность»; сам пароль не сохраняется.

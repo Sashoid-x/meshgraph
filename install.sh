@@ -4,16 +4,18 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Sashoid-x/meshgraph/main/install.sh | bash
 #
-# Скрипт спрашивает каталог, порт, интерфейс слушания, адрес MQTT-брокера и
-# автозапуск (Enter — значение по умолчанию).  Ответы читаются из /dev/tty,
-# поэтому поток stdin при «curl | bash» не ломается; без терминала (cron, CI)
-# ставятся значения по умолчанию.
+# Скрипт спрашивает каталог, порт, интерфейс слушания, адрес MQTT-брокера,
+# пароль для настроек и автозапуск (Enter — значение по умолчанию).  Ответы
+# читаются из /dev/tty, поэтому поток stdin при «curl | bash» не ломается;
+# без терминала (cron, CI) ставятся значения по умолчанию.
 #
 # Всё можно задать переменными окружения — вопрос пропускается:
 #   MESHGRAPH_HOME         каталог установки     (~/nodegraph)
 #   MESHGRAPH_PORT         порт веб-интерфейса   (5010)
 #   MESHGRAPH_HOST         интерфейс слушания    (0.0.0.0)
 #   MESHGRAPH_BROKER       адрес MQTT-брокера    (пусто — в настройках)
+#   MESHGRAPH_PASSWORD     пароль для настроек   (пусто — без пароля;
+#                          заданный в config.yaml не сбрасывается)
 #   MESHGRAPH_SYSTEMD      автозапуск д/н        (д)
 #   MESHGRAPH_NONINTERACTIVE=1   не спрашивать ничего, только дефолты
 #   MESHGRAPH_REPO / MESHGRAPH_BRANCH / MESHGRAPH_ARCHIVE / MESHGRAPH_UNIT
@@ -83,6 +85,30 @@ ask HOST   MESHGRAPH_HOST   "Интерфейс (0.0.0.0 — вся сеть, 12
 ask BROKER MESHGRAPH_BROKER "Адрес MQTT-брокера (Enter — позже, в диалоге «Настройки»)" "$DEF_BROKER"
 ask SYSTEMD MESHGRAPH_SYSTEMD "Ставить автозапуск в systemd (д/н)"      "д"
 
+# Пароль на настройки спрашивается до скачивания — при опечатке не жалко
+# перезапустить. Пустой ответ оставляет настройки открытыми (задаётся потом
+# диалогом «Настройки → Безопасность»); уже заданный в config.yaml пароль
+# установщик не трогает, если его явно не передали через MESHGRAPH_PASSWORD.
+PASSWORD="${MESHGRAPH_PASSWORD:-}"
+if [ -z "$PASSWORD" ]; then
+  if [ -n "$(cfg_get settings_password_hash)" ]; then
+    say "Пароль на настроек уже задан — оставляю как есть"
+  elif [ -n "$TTY_FD" ] && [ -z "${MESHGRAPH_NONINTERACTIVE:-}" ]; then
+    printf 'Пароль для настроек (Enter — без пароля, вводится в «Настройки → Безопасность»): '
+    IFS= read -r -s PASSWORD <&3 || PASSWORD=""
+    printf '\n'
+    if [ -n "$PASSWORD" ]; then
+      printf 'Повторите пароль: '
+      IFS= read -r -s PASSWORD_AGAIN <&3 || PASSWORD_AGAIN=""
+      printf '\n'
+      [ "$PASSWORD" = "$PASSWORD_AGAIN" ] || die "пароли не совпали — запустите установщик заново"
+    fi
+  fi
+fi
+if [ -n "$PASSWORD" ] && [ "${#PASSWORD}" -lt 4 ]; then
+  die "пароль должен быть не короче 4 символов"
+fi
+
 case "$PORT" in
   ''|*[!0-9]*) die "порт должен быть числом 1–65535, получено: $PORT" ;;
 esac
@@ -93,7 +119,11 @@ case "$SYSTEMD" in
   [Нн]|[Нн]ет|[Nn]|[Nn]o|[Nn]O|0)                     USE_SYSTEMD=0 ;;
   *) die "ожидалось д или н, получено: $SYSTEMD" ;;
 esac
-say "Итого: $DEST | порт $PORT | $HOST | брокер: ${BROKER:-— в настройках} | systemd: $([ "$USE_SYSTEMD" = 1 ] && echo да || echo нет)"
+say "Итого: $DEST | порт $PORT | $HOST | брокер: ${BROKER:-— в настройках} | пароль на настройки: $([ -n "$PASSWORD" ] && printf 'задан' || printf 'нет') | systemd: $([ "$USE_SYSTEMD" = 1 ] && echo да || echo нет)"
+if [ "$HOST" != "127.0.0.1" ] && [ -z "$PASSWORD" ] && [ -z "$(cfg_get settings_password_hash)" ]; then
+  printf '\033[1;33m⚠\033[0m Пароль не задан, а интерфейс слушает %s — настройки открыты всей сети.\n' "$HOST"
+  printf '    Задайте его после установки: «Настройки» → «Безопасность».\n'
+fi
 
 # --- 1. Код -----------------------------------------------------------------
 say "Код: $DEST"
@@ -130,6 +160,27 @@ sed -i \
   -e "s|^mqtt_broker_address:.*|mqtt_broker_address: '$BROKER_Q'|" \
   config.yaml
 mkdir -p data
+
+# --- 4a. Пароль на настройки -----------------------------------------------
+# В config.yaml хранится только хэш PBKDF2 (см. meshgraph.config.hash_password);
+# сам пароль никуда не пишется. Существующий ключ заменяется, отсутствующий —
+# добавляется в конец файла.
+if [ -n "$PASSWORD" ]; then
+  say "Хэш пароля → config.yaml"
+  HASH="$(PASSWORD_TO_HASH="$PASSWORD" "$DEST/.venv/bin/python" -c '
+import os, sys
+sys.path.insert(0, os.getcwd())
+from meshgraph.config import hash_password
+print(hash_password(os.environ["PASSWORD_TO_HASH"]))
+')" || die "не удалось вычислить хэш пароля"
+  if grep -q '^settings_password_hash:' config.yaml; then
+    sed -i "s|^settings_password_hash:.*|settings_password_hash: '$HASH'|" config.yaml
+  else
+    printf "\n# Пароль на настройки: только хэш PBKDF2, ввод и смена — в разделе\n# «Безопасность» диалога настроек.\nsettings_password_hash: '%s'\n" \
+      "$HASH" >> config.yaml
+  fi
+  ok "Пароль на настройки задан"
+fi
 
 # --- 5. systemd -------------------------------------------------------------
 if [ "$USE_SYSTEMD" = 1 ]; then
@@ -174,7 +225,17 @@ EOF
   HOSTIP="$(hostname -I 2>/dev/null | awk '{print $1}')"
   ok "Готово: http://${HOSTIP:-127.0.0.1}:$PORT"
   printf '    Настройки брокера — кнопка «Настройки» на странице.\n'
+  if [ -n "$PASSWORD" ]; then
+    printf '    Настройки защищены паролем — он спросится при открытии диалога.\n'
+  else
+    printf '    Пароль на настройки не задан — задайте в «Настройки → Безопасность».\n'
+  fi
   printf '    Лог: journalctl -u %s -f\n' "$UNIT"
 else
   ok "Установлено без автозапуска. Запуск: cd $DEST && uv run meshgraph"
+  if [ -n "$PASSWORD" ]; then
+    printf '    Настройки защищены паролем — он спросится при открытии диалога.\n'
+  else
+    printf '    Пароль на настройки не задан — задайте в «Настройки → Безопасность».\n'
+  fi
 fi
