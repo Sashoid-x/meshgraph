@@ -964,10 +964,10 @@ def jsflow() -> "quickjs.Context":
     return ctx
 
 
-def test_flow_plan_keeps_only_on_screen_fan_legs(jsflow):
+def test_flow_plan_draws_direct_legs_for_on_screen_nodes(jsflow):
     routes = [
         {
-            "kind": "fan",
+            "kind": "direct",
             "sender": 1,
             "packet_id": 7,
             "ts": 100.0,
@@ -981,15 +981,33 @@ def test_flow_plan_keeps_only_on_screen_fan_legs(jsflow):
     plan = run(
         jsflow,
         f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2, 3, 4],"
-        " ['1-2', '1-4'], MESHGRAPH_FLOW_PARAMS)",
+        " MESHGRAPH_FLOW_PARAMS)",
     )
-    # Узла 9 в графе нет, связи 1-3 тоже нет — остаётся одна спица 1-2.
+    # Узла 9 в графе нет — нога отбрасывается; отсутствие ребра 1-3 не мешает:
+    # пакет всё равно летел от отправителя к шлюзу.
     assert len(plan["routes"]) == 1
-    assert [leg["to"] for leg in plan["routes"][0]["legs"]] == [2]
+    assert [leg["to"] for leg in plan["routes"][0]["legs"]] == [2, 3]
     assert plan["totalMs"] > 0
+    # Цветовое «ярлык» пакета проходит в план как есть.
+    assert plan["routes"][0]["pid"] == 7
 
 
-def test_flow_plan_drops_broken_traceroute_chain(jsflow):
+def test_flow_plan_pid_falls_back_when_packet_id_missing(jsflow):
+    routes = [
+        {"kind": "direct", "sender": 1, "packet_id": None, "ts": 3.5,
+         "legs": [{"to": 2, "snr": 5.0}]}
+    ]
+    plan = run(
+        jsflow,
+        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2],"
+        " MESHGRAPH_FLOW_PARAMS)",
+    )
+    # Без id — детерминированная строка «отправитель:время», цвет всё равно
+    # различим.
+    assert plan["routes"][0]["pid"] == "1:3.5"
+
+
+def test_flow_plan_drops_chain_with_missing_node(jsflow):
     routes = [
         {
             "kind": "traceroute",
@@ -1002,16 +1020,16 @@ def test_flow_plan_drops_broken_traceroute_chain(jsflow):
     ok = run(
         jsflow,
         f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2, 3],"
-        " ['1-2', '2-3'], MESHGRAPH_FLOW_PARAMS)",
+        " MESHGRAPH_FLOW_PARAMS)",
     )
     # Цепочка: вторая нога начинается там, где кончилась первая.
     legs = ok["routes"][0]["legs"]
     assert [(leg["from"], leg["to"]) for leg in legs] == [(1, 2), (2, 3)]
-    # Без среднего ребра маршрут исчезает целиком — шарик не летает над дырой.
+    # Без среднего узла маршрут исчезает целиком — координат-то нет.
     broken = run(
         jsflow,
-        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2, 3],"
-        " ['1-3'], MESHGRAPH_FLOW_PARAMS)",
+        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2],"
+        " MESHGRAPH_FLOW_PARAMS)",
     )
     assert broken["routes"] == []
 
@@ -1019,11 +1037,11 @@ def test_flow_plan_drops_broken_traceroute_chain(jsflow):
 def test_flow_plan_lays_routes_out_in_time(jsflow):
     routes = [
         {
-            "kind": "fan",
+            "kind": "direct",
             "sender": 1,
             "packet_id": 1,
             "ts": 1.0,
-            "legs": [{"to": 2, "snr": 5.0}, {"to": 3, "snr": 5.0}],
+            "legs": [{"to": 2, "snr": 5.0}],
         },
         {
             "kind": "traceroute",
@@ -1036,17 +1054,17 @@ def test_flow_plan_lays_routes_out_in_time(jsflow):
     plan = run(
         jsflow,
         f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2, 3, 4],"
-        " ['1-2', '1-3', '3-4'], MESHGRAPH_FLOW_PARAMS)",
+        " MESHGRAPH_FLOW_PARAMS)",
     )
     p = plan["params"]
-    fan, trace = plan["routes"]
-    assert fan["startMs"] == 0
+    direct, trace = plan["routes"]
+    assert direct["startMs"] == 0
     assert trace["startMs"] == p["routeStaggerMs"]
-    # Веер: ноги почти одновременно (небольшой разброс); трассировка: шаги
-    # друг за другом в темпе hopMs.
-    assert [leg["at"] for leg in fan["legs"]] == [0, p["fanSpreadMs"]]
+    # Прямой пакет: одна нога целиком в темпе hopMs; трассировка: шаги друг
+    # за другом в темпе hopMs.
+    assert [leg["at"] for leg in direct["legs"]] == [0]
     assert [leg["at"] for leg in trace["legs"]] == [0, p["hopMs"]]
-    assert fan["durationMs"] == p["fanSpreadMs"] + p["hopMs"]
+    assert direct["durationMs"] == p["hopMs"]
     assert trace["durationMs"] == 2 * p["hopMs"]
     assert (
         plan["totalMs"]
@@ -1057,7 +1075,7 @@ def test_flow_plan_lays_routes_out_in_time(jsflow):
 def test_flow_frame_interpolates_and_fades(jsflow):
     routes = [
         {
-            "kind": "fan",
+            "kind": "direct",
             "sender": 1,
             "packet_id": 1,
             "ts": 1.0,
@@ -1066,7 +1084,7 @@ def test_flow_frame_interpolates_and_fades(jsflow):
     ]
     jsflow.eval(
         "var flowPlan = meshgraphFlowPlan("
-        f"{json.dumps(routes)}, [1, 2], ['1-2'], MESHGRAPH_FLOW_PARAMS);"
+        f"{json.dumps(routes)}, [1, 2], MESHGRAPH_FLOW_PARAMS);"
     )
     jsflow.eval(
         "var flowNodes = new Map([[1, {x: 0, y: 0, z: 0}],"
@@ -1078,6 +1096,7 @@ def test_flow_frame_interpolates_and_fades(jsflow):
     frame = run(jsflow, "meshgraphFlowAt(flowPlan, 0, flowNodes)")
     assert len(frame["dots"]) == 1 and len(frame["legs"]) == 1
     assert (frame["dots"][0]["x"], frame["dots"][0]["y"]) == (0, 0)
+    assert frame["dots"][0]["pid"] == 1
     assert frame["legs"][0]["phase"] == 1
     assert not frame["done"]
 
@@ -1103,7 +1122,7 @@ def test_flow_frame_interpolates_and_fades(jsflow):
 def test_flow_frame_drops_legs_whose_node_vanished(jsflow):
     routes = [
         {
-            "kind": "fan",
+            "kind": "direct",
             "sender": 1,
             "packet_id": 1,
             "ts": 1.0,
@@ -1112,23 +1131,67 @@ def test_flow_frame_drops_legs_whose_node_vanished(jsflow):
     ]
     jsflow.eval(
         "var gonePlan = meshgraphFlowPlan("
-        f"{json.dumps(routes)}, [1, 2], ['1-2'], MESHGRAPH_FLOW_PARAMS);"
+        f"{json.dumps(routes)}, [1, 2], MESHGRAPH_FLOW_PARAMS);"
     )
     jsflow.eval("var goneNodes = new Map([[1, {x: 0, y: 0, z: 0}]]);")
     frame = run(jsflow, "meshgraphFlowAt(gonePlan, 100, goneNodes)")
     assert frame["dots"] == [] and frame["legs"] == []
 
 
+def test_flow_hue_identifies_packets(jsflow):
+    # Один id — один цвет везде; число и его строка совпадают.
+    hue = run(jsflow, "meshgraphFlowHue(42)")
+    assert 0 <= hue < 360
+    assert run(jsflow, "meshgraphFlowHue(42)") == hue
+    assert run(jsflow, 'meshgraphFlowHue("42")') == hue
+    # Разные id разбросаны по кругу — пакеты различимы.
+    hues = run(jsflow, "[...Array(64)].map((_, i) => meshgraphFlowHue(i))")
+    assert all(0 <= h < 360 for h in hues)
+    assert len(set(hues)) > 32
+    # Без id детерминированно (не NaN и не общий корзинный мусор).
+    assert run(jsflow, "meshgraphFlowHue(null)") == run(
+        jsflow, "meshgraphFlowHue(undefined)"
+    )
+
+
+def test_flow_plan_batches_keep_separate_pools(jsflow):
+    routes = [
+        {"kind": "direct", "sender": 1, "packet_id": 7, "ts": 1.0,
+         "legs": [{"to": 2, "snr": 5.0}]}
+    ]
+    first = run(
+        jsflow,
+        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2],"
+        " MESHGRAPH_FLOW_PARAMS, 1)",
+    )
+    second = run(
+        jsflow,
+        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2],"
+        " MESHGRAPH_FLOW_PARAMS, 2)",
+    )
+    # Живой режим играет батчи одновременно: их ключи не должны драться за
+    # один и тот же элемент пула.
+    assert first["routes"][0]["key"] != second["routes"][0]["key"]
+    assert (
+        first["routes"][0]["legs"][0]["key"]
+        != second["routes"][0]["legs"][0]["key"]
+    )
+
+
 def test_packet_flow_wiring():
     """Кнопки, скрипт, endpoint и 3D-рендер собираются вместе."""
     html = INDEX_HTML.read_text(encoding="utf-8")
     assert 'id="flowReplay"' in html
-    assert 'id="flowPulse"' in html
+    assert 'id="flowLive"' in html
     assert "packetflow.js" in html
     app = APP_JS.read_text(encoding="utf-8")
     assert "/api/packet_routes?" in app
+    assert "/api/packet_flow?" in app
     assert "meshgraphFlowPlan(" in app and "meshgraphFlowAt(" in app
-    assert "flowApplyPulse()" in app
+    assert "flowApplyLive()" in app
+    # Тоггл считает от фактического состояния: пустой store = включён, и
+    # первый клик обязан выключить, а не записать снова "1" (регресс e2e).
+    assert 'flowLiveEnabled() ? "0" : "1"' in app
     three_d = GRAPH3D_JS.read_text(encoding="utf-8")
     # Экспорт renderFlow в window.meshgraph3D (кадры рисуются из app.js).
     assert "renderFlow," in three_d

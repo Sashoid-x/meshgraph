@@ -1,24 +1,29 @@
-/* Packet route replay engine (the glowing dots over the graph).
+/* Packet flow engine (the glowing dots over the graph).
  *
- * Data comes from /api/packet_routes: either a fan (one mesh packet heard by
- * several gateways) or a traceroute walk (the packet crawling node by node).
+ * Data comes from /api/packet_routes (replay ▶) or /api/packet_flow (live ✦):
+ * every reception is a movement — a direct packet flying sender → gateway,
+ * or a traceroute walk node by node.  The same packet id keeps one colour
+ * wherever it flies, so duplicate receptions read as a single traveller.
  * This file is pure logic — no DOM, no three.js.  app.js asks for one frame
  * per animation tick and paints it twice: as an SVG layer in 2D and through
  * window.meshgraph3D.renderFlow in 3D.  A frame is a pure function of
  * (plan, elapsed, node coordinates), which is what lets QuickJS test it.
+ * Live mode runs several plans at once; batchId keeps their pools apart.
  */
 
 "use strict";
 
 globalThis.MESHGRAPH_FLOW_PARAMS = {
   hopMs: 520, // dot travel along a single leg
-  fanSpreadMs: 110, // gap between the legs of one fanned packet
-  routeStaggerMs: 180, // gap between consecutive routes of a playback
+  routeStaggerMs: 180, // gap between consecutive routes of a batch
   legFadeMs: 1100, // leg highlight decay after the dot has passed
-  maxRoutes: 40, // cap per playback batch
+  maxRoutes: 40, // routes per plan batch
+  maxActivePlans: 6, // plans playing at once
+  maxInflight: 120, // active + queued cap; live arrivals drop beyond it
   replayMinutes: 30, // window of the replay button
-  pulseMinutes: 10, // window of the background pulse
-  pulsePollMs: 20000,
+  replayLimit: 200, // server-side cap for the replay window
+  livePollMs: 2000, // live feed poll interval
+  liveLimit: 60, // server-side cap per live poll
   dotRadius: 4.5,
   haloRadius: 12,
   legWidth: 2.5,
@@ -26,37 +31,60 @@ globalThis.MESHGRAPH_FLOW_PARAMS = {
 };
 
 /**
+ * Stable hue for a packet id (FNV-1a).
+ *
+ * The same packet keeps its colour in every part of the graph — that is
+ * what ties the duplicate receptions of one packet together — while
+ * different packets land on different hues.  Id-less rows fall back to a
+ * caller-built "sender:ts" string, so they differ too.
+ *
+ * @param {number|string} packetId
+ * @returns {number} hue in [0, 360)
+ */
+function meshgraphFlowHue(packetId) {
+  const text =
+    packetId === undefined || packetId === null ? "" : String(packetId);
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % 360;
+}
+
+/**
  * Filter the routes down to what is actually on screen and lay them out in
  * time.
  *
- * Fan legs keep only the spokes whose gateway node *and* edge are present; a
- * traceroute chain is dropped whole when a single hop has no edge — dots
- * must ride real links, never fly over a gap.
+ * A movement rides straight between its endpoints: the chat graph may hide
+ * the link behind filters, but the packet still moved — only a *missing
+ * node* drops a leg (nothing to anchor it to).  A traceroute chain breaks
+ * whole when one hop's node is gone.
  *
- * @param {Array} routes /api/packet_routes result, both kinds mixed
+ * @param {Array} routes /api/packet_routes or /api/packet_flow movements
  * @param {Array} nodeIds ids of the nodes currently in the graph
- * @param {Array} linkKeys "a-b" keys of the current direct links
  * @param {object} params MESHGRAPH_FLOW_PARAMS
+ * @param {number} [batchId] namespaces the pool keys — overlapping live
+ *   batches keep their own elements instead of fighting for one
  * @returns {{routes: Array, totalMs: number, params: object}}
  */
-function meshgraphFlowPlan(routes, nodeIds, linkKeys, params) {
+function meshgraphFlowPlan(routes, nodeIds, params, batchId = 0) {
   const have = new Set(nodeIds);
-  const links = new Set(linkKeys);
-  const edge = (a, b) => links.has([a, b].sort((x, y) => x - y).join("-"));
+  const tag = `b${batchId}:`;
 
   const planned = [];
   routes.forEach((route, index) => {
     if (!have.has(route.sender)) return;
     let legs = [];
-    if (route.kind === "fan") {
+    if (route.kind === "direct") {
       legs = (route.legs || [])
-        .filter((leg) => have.has(leg.to) && edge(route.sender, leg.to))
+        .filter((leg) => have.has(leg.to))
         .map((leg, i) => ({
-          key: `${route.kind}-${index}:${i}`,
+          key: `${tag}direct-${index}:${i}`,
           from: route.sender,
           to: leg.to,
           snr: leg.snr === undefined ? null : leg.snr,
-          at: i * params.fanSpreadMs,
+          at: 0,
         }));
     } else if (route.kind === "traceroute") {
       // Consecutive legs chain: each starts where the previous one ended.
@@ -64,7 +92,7 @@ function meshgraphFlowPlan(routes, nodeIds, linkKeys, params) {
       const chain = [];
       let intact = true;
       for (const leg of route.legs || []) {
-        if (!have.has(leg.to) || !edge(cursor, leg.to)) {
+        if (!have.has(leg.to)) {
           intact = false;
           break;
         }
@@ -74,7 +102,7 @@ function meshgraphFlowPlan(routes, nodeIds, linkKeys, params) {
       if (intact) {
         legs = chain.map((leg, i) => ({
           ...leg,
-          key: `${route.kind}-${index}:${i}`,
+          key: `${tag}traceroute-${index}:${i}`,
           at: i * params.hopMs,
         }));
       }
@@ -85,8 +113,13 @@ function meshgraphFlowPlan(routes, nodeIds, linkKeys, params) {
       0
     );
     planned.push({
-      key: `${route.kind}-${index}`,
+      key: `${tag}${route.kind}-${index}`,
       kind: route.kind,
+      // Colour identity: same packet id → same hue wherever it flies.
+      pid:
+        route.packet_id === undefined || route.packet_id === null
+          ? `${route.sender}:${route.ts}`
+          : route.packet_id,
       ts: route.ts,
       legs,
       startMs: index * params.routeStaggerMs,
@@ -110,8 +143,8 @@ function meshgraphFlowPlan(routes, nodeIds, linkKeys, params) {
  * smoothstep easing; finished legs linger as a fading highlight.
  *
  * @returns {{dots: Array, legs: Array, done: boolean}}
- *   dots: {key, x, y, z, from, to, snr}
- *   legs: {key, from, to, snr, ax..bz, phase}  phase 1 = lit, decaying to 0
+ *   dots: {key, x, y, z, from, to, snr, pid}
+ *   legs: {key, from, to, snr, pid, ax..bz, phase}  phase 1 = lit, decaying to 0
  */
 function meshgraphFlowAt(plan, elapsed, nodesById) {
   const dots = [];
@@ -140,6 +173,7 @@ function meshgraphFlowAt(plan, elapsed, nodesById) {
         from: leg.from,
         to: leg.to,
         snr: leg.snr,
+        pid: route.pid,
       };
       if (le <= params.hopMs) {
         const t = smooth(le / params.hopMs);

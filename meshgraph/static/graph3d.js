@@ -843,8 +843,10 @@ function renderFlow(frame) {
       view.flowDots.set(key, rec);
     }
     rec.group.position.set(dot.x, dot.y, dot.z);
-    rec.core.material.color.set(accent);
-    rec.glow.material.color.set(accent);
+    // Цвет шарика — по id пакета (как в 2D); ноги остаются акцентными.
+    const color = dot.color || accent;
+    rec.core.material.color.set(color);
+    rec.glow.material.color.set(color);
     rec.glow.material.blending = blending;
     rec.core.material.blending = blending;
   });

@@ -499,8 +499,8 @@ code {
 .flow-leg-halo { stroke: var(--accent); }
 :root[data-theme="light"] .flow-leg-halo { stroke: rgba(10, 13, 19, .35); }
 /* Шарик: акцентное ядро в белом кольце, ореол — размытое пятно цвета. */
-.flow-dot { fill: var(--accent); stroke: rgba(255, 255, 255, .9); stroke-width: 1.5px; }
-.flow-dot-halo { fill: var(--accent); opacity: .35; filter: blur(2px); }
+.flow-dot { stroke: rgba(255, 255, 255, .9); stroke-width: 1.5px; }
+.flow-dot-halo { opacity: .35; filter: blur(2px); }
 :root[data-theme="light"] .flow-dot { stroke: #fff; }
 
 /* --------------------------------------------------------------- 3d view */
