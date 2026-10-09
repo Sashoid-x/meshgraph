@@ -113,6 +113,19 @@ def create_app(
         )
         return jsonify(payload)
 
+    @app.get("/api/packet_routes")
+    def api_packet_routes():
+        # Public like /api/graph: it only re-frames data the graph already
+        # shows (who heard what over which hops), nothing new leaks.
+        current = store_ref.get()
+        args = request.args
+        payload = graph.packet_routes(
+            settings=current,
+            minutes=args.get("minutes", graph.REPLAY_MINUTES_DEFAULT, type=int),
+            limit=args.get("limit", graph.DEFAULT_ROUTE_LIMIT, type=int),
+        )
+        return jsonify(payload)
+
     @app.get("/api/channels")
     def api_channels():
         current = store_ref.get()

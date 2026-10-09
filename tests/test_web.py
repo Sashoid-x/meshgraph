@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from meshgraph import store, web
+from meshgraph import graph, store, web
 from meshgraph.decoder import DecodedPacket
 
 from .conftest import make_packet
@@ -233,6 +233,18 @@ def test_graph_api_survives_junk_query_params(client):
     ).get_json()
     assert payload["filters"]["hours"] == 24
     assert payload["filters"]["min_snr"] == -200.0
+
+
+def test_packet_routes_endpoint(client):
+    payload = client.get("/api/packet_routes?minutes=30").get_json()
+    assert payload["minutes"] == 30
+    assert payload["routes"], "the seeded traceroute is replayable"
+    route = payload["routes"][0]
+    assert route["kind"] in {"fan", "traceroute"}
+    assert route["legs"] and "to" in route["legs"][0]
+    # An absurd window falls back to the default instead of failing (G-P2-1).
+    broken = client.get("/api/packet_routes?minutes=999999").get_json()
+    assert broken["minutes"] == graph.REPLAY_MINUTES_DEFAULT
 
 
 def test_channels_endpoint(client):
