@@ -848,26 +848,32 @@ def build_graph(
 
 
 # ---------------------------------------------------------------------------
-# Packet routes (replay data for the glowing-packet animation)
+# Packet routes (movement data for the glowing-packet animation)
 # ---------------------------------------------------------------------------
 #
-# Two stories the front end replays on the graph (packetflow.js):
+# Every reception the server sees becomes a movement the front end
+# (packetflow.js) draws over the graph:
 #
-# ``fan``         one mesh packet heard by two or more gateways — legs fan
-#                 out from the sender to each gateway.  Only direct receptions
-#                 count (hop_start == hop_limit), so every leg is an edge the
-#                 rssi half of the graph draws.
+# ``direct``      a packet travelling from its sender to the gateway that
+#                 heard it — one leg.  A packet heard by several gateways
+#                 yields one movement per reception: same packet id, same
+#                 colour, different parts of the graph.  The chat folds
+#                 these duplicates together; the animation exploits them.
 # ``traceroute``  a walk along the RF hops parsed from a TRACEROUTE_APP
 #                 payload — the packet crawls node by node.
 #
-# Pure data: nothing is filtered by the current graph mode here, the front
-# end drops legs whose nodes or edges are not on screen.
+# Self-receptions (the gateway originated the packet itself) travel nowhere
+# we can draw and are skipped.  Nothing is filtered by the current graph
+# mode or by link existence: the front end drops legs whose nodes are not
+# on screen.
 
-DEFAULT_ROUTE_LIMIT = 40
-MAX_ROUTE_LIMIT = 100
+REPLAY_ROUTE_LIMIT = 200  # the ▶ button: the whole window, freshest cap
+LIVE_ROUTE_LIMIT = 60  # one live poll
+MAX_ROUTE_LIMIT = 500
 REPLAY_MINUTES_DEFAULT = 30
 REPLAY_MINUTES_MIN = 1
 REPLAY_MINUTES_MAX = 7 * 24 * 60
+LIVE_BACKFILL_SECONDS = 120  # history served when the live feed switches on
 
 
 def sanitize_minutes(minutes: Any) -> int:
@@ -880,145 +886,100 @@ def sanitize_minutes(minutes: Any) -> int:
     return REPLAY_MINUTES_DEFAULT
 
 
-def _fan_routes(
-    settings: Settings, start_time: float, limit: int
-) -> list[dict[str, Any]]:
-    """Packets heard by >= 2 gateways; one leg per gateway, freshest first."""
-    groups = store.query(
-        settings.db_file,
-        """
-        SELECT from_node_id, mesh_packet_id, MIN(timestamp) AS first_ts
-        FROM packets
-        WHERE timestamp >= ?
-          AND mesh_packet_id IS NOT NULL
-          AND from_node_id IS NOT NULL
-          AND gateway_node_id IS NOT NULL
-          AND gateway_node_id != from_node_id
-          AND hop_start IS NOT NULL AND hop_start = hop_limit
-          AND portnum_name IS NOT 'TRACEROUTE_APP'
-        GROUP BY from_node_id, mesh_packet_id
-        HAVING COUNT(DISTINCT gateway_node_id) >= 2
-        ORDER BY first_ts DESC
-        LIMIT ?
-        """,
-        (start_time, limit),
-    )
-    if not groups:
-        return []
+def sanitize_limit(limit: Any, default: int) -> int:
+    try:
+        value = int(limit)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if value < 1:
+        return default
+    return min(value, MAX_ROUTE_LIMIT)
 
-    keys = [(g["from_node_id"], g["mesh_packet_id"]) for g in groups]
-    placeholders = ",".join("(?, ?)" for _ in keys)
-    params: list[Any] = [start_time]
-    for sender, packet_id in keys:
-        params.extend((sender, packet_id))
+
+def _traceroute_movement(row: Any) -> dict[str, Any] | None:
+    """Chain of RF hops for one TRACEROUTE_APP row, or None if unusable."""
+    if not row["raw_payload"] or not row["processed"]:
+        return None
+    try:
+        hops = build_rf_hops(row)
+    except Exception:  # malformed payload: skip the row, keep the feed
+        logger.debug("Route payload %s failed to parse", row["id"], exc_info=True)
+        return None
+    if not hops:
+        return None
+    if any(BROADCAST_NODE_ID in (a, b) for a, b, _snr in hops):
+        # A chain through a placeholder id cannot be drawn on the graph.
+        return None
+    return {
+        "kind": "traceroute",
+        "sender": hops[0][0],
+        "packet_id": row["mesh_packet_id"],
+        "ts": row["timestamp"],
+        "legs": [
+            {
+                "to": hop_to,
+                "ts": row["timestamp"],
+                # Unknown or injected (MQTT) SNR keeps the leg — the chain
+                # must not break — but loses its measurement.
+                "snr": (
+                    snr
+                    if is_plausible_traceroute_snr(snr)
+                    and snr != SNR_INJECTED
+                    else None
+                ),
+            }
+            for _hop_from, hop_to, snr in hops
+        ],
+    }
+
+
+def _movement_from_row(row: Any) -> dict[str, Any] | None:
+    """One packet reception as an animatable movement (None = nothing to draw)."""
+    if row["portnum_name"] == "TRACEROUTE_APP":
+        return _traceroute_movement(row)
+    sender = row["from_node_id"]
+    gateway = row["gateway_node_id"]
+    if gateway == sender:
+        return None  # self-reception: the packet left this node, no path
+    return {
+        "kind": "direct",
+        "sender": sender,
+        "packet_id": row["mesh_packet_id"],
+        "ts": row["timestamp"],
+        "legs": [
+            {
+                "to": gateway,
+                "ts": row["timestamp"],
+                "rssi": row["rssi"],
+                "snr": row["snr"],
+            }
+        ],
+    }
+
+
+def _query_movements(
+    settings: Settings, time_clause: str, params: list[Any], limit: int
+) -> list[dict[str, Any]]:
+    """Freshest ``limit`` movements matching the time predicate, oldest first."""
     rows = store.query(
         settings.db_file,
         f"""
-        SELECT from_node_id, mesh_packet_id, gateway_node_id, timestamp, rssi, snr
+        SELECT id, timestamp, from_node_id, to_node_id, gateway_node_id,
+               mesh_packet_id, portnum_name, raw_payload, rssi, snr,
+               hop_start, hop_limit, processed
         FROM packets
-        WHERE timestamp >= ?
-          AND (from_node_id, mesh_packet_id) IN ({placeholders})
+        WHERE {time_clause}
+          AND from_node_id IS NOT NULL
           AND gateway_node_id IS NOT NULL
-          AND gateway_node_id != from_node_id
-          AND hop_start IS NOT NULL AND hop_start = hop_limit
-        ORDER BY timestamp
-        """,
-        params,
-    )
-
-    # One leg per gateway: dedup normally keeps a single row, but if a
-    # duplicate slipped through, the strongest reception wins.
-    best: dict[tuple[int, int, int], dict[str, Any]] = {}
-    for row in rows:
-        key = (row["from_node_id"], row["mesh_packet_id"], row["gateway_node_id"])
-        prev = best.get(key)
-        if prev is None or (row["rssi"] or -999) > (prev["rssi"] or -999):
-            best[key] = row
-    by_packet: dict[tuple[int, int], list[dict[str, Any]]] = {}
-    for (sender, packet_id, _gateway), row in best.items():
-        by_packet.setdefault((sender, packet_id), []).append(row)
-
-    routes: list[dict[str, Any]] = []
-    for sender, packet_id in keys:
-        legs = by_packet.get((sender, packet_id))
-        if not legs or len(legs) < 2:
-            continue
-        legs.sort(key=lambda row: row["timestamp"])
-        routes.append(
-            {
-                "kind": "fan",
-                "sender": sender,
-                "packet_id": packet_id,
-                "ts": legs[0]["timestamp"],
-                "legs": [
-                    {
-                        "to": row["gateway_node_id"],
-                        "ts": row["timestamp"],
-                        "rssi": row["rssi"],
-                        "snr": row["snr"],
-                    }
-                    for row in legs
-                ],
-            }
-        )
-    return routes
-
-
-def _traceroute_routes(
-    settings: Settings, start_time: float, limit: int
-) -> list[dict[str, Any]]:
-    """RF hop walks from TRACEROUTE_APP payloads, freshest first."""
-    rows = store.query(
-        settings.db_file,
-        """
-        SELECT id, timestamp, from_node_id, to_node_id, hop_start, hop_limit,
-               mesh_packet_id, raw_payload
-        FROM packets
-        WHERE portnum_name = 'TRACEROUTE_APP'
-          AND processed = 1
-          AND timestamp >= ?
+          AND (from_node_id != gateway_node_id
+               OR portnum_name = 'TRACEROUTE_APP')
         ORDER BY timestamp DESC
         LIMIT ?
         """,
-        (start_time, limit),
+        [*params, limit],
     )
-    routes: list[dict[str, Any]] = []
-    for row in rows:
-        if not row["raw_payload"]:
-            continue
-        try:
-            hops = build_rf_hops(row)
-        except Exception:  # malformed payload: skip the row, keep the routes
-            logger.debug("Route payload %s failed to parse", row["id"], exc_info=True)
-            continue
-        if not hops:
-            continue
-        if any(BROADCAST_NODE_ID in (a, b) for a, b, _snr in hops):
-            # A chain through a placeholder id cannot be drawn on the graph.
-            continue
-        routes.append(
-            {
-                "kind": "traceroute",
-                "sender": hops[0][0],
-                "packet_id": row["mesh_packet_id"],
-                "ts": row["timestamp"],
-                "legs": [
-                    {
-                        "to": hop_to,
-                        "ts": row["timestamp"],
-                        # Unknown or injected (MQTT) SNR keeps the leg — the
-                        # chain must not break — but loses its colour.
-                        "snr": (
-                            snr
-                            if is_plausible_traceroute_snr(snr)
-                            and snr != SNR_INJECTED
-                            else None
-                        ),
-                    }
-                    for _hop_from, hop_to, snr in hops
-                ],
-            }
-        )
+    routes = [movement for row in rows if (movement := _movement_from_row(row))]
+    routes.reverse()  # chronological: the replay follows real time
     return routes
 
 
@@ -1027,26 +988,46 @@ def packet_routes(
     minutes: int | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Replayable routes: who heard the same packet, and along which hops.
+    """Every movement inside a replay window, oldest first (the ▶ button).
 
-    Both sources share one window and one cap; the freshest ``limit`` routes
-    come back in chronological order so the animation follows real time.
+    The freshest ``limit`` receptions come back in chronological order so
+    the animation replays them the way they happened.
     """
     minutes = sanitize_minutes(minutes)
-    try:
-        parsed_limit = int(limit)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        parsed_limit = DEFAULT_ROUTE_LIMIT
-    parsed_limit = max(1, min(parsed_limit, MAX_ROUTE_LIMIT))
+    parsed_limit = sanitize_limit(limit, REPLAY_ROUTE_LIMIT)
     start_time = time.time() - minutes * 60
-
-    routes = _fan_routes(settings, start_time, parsed_limit)
-    routes += _traceroute_routes(settings, start_time, parsed_limit)
-    routes.sort(key=lambda route: route["ts"])
-    routes = routes[-parsed_limit:]
+    routes = _query_movements(settings, "timestamp >= ?", [start_time], parsed_limit)
     return {
         "minutes": minutes,
         "generated_at": time.time(),
+        "routes": routes,
+    }
+
+
+def packet_flow(
+    settings: Settings,
+    since: Any = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Movements that arrived after ``since`` — the live stream feed.
+
+    ``since`` is a server timestamp; missing, garbage or future values fall
+    back to a short backfill so switching the live feed on immediately
+    shows recent packets.  ``generated_at`` lets the client advance with the
+    server clock instead of its own.
+    """
+    parsed_limit = sanitize_limit(limit, LIVE_ROUTE_LIMIT)
+    now = time.time()
+    try:
+        parsed_since = float(since)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        parsed_since = 0.0
+    if not math.isfinite(parsed_since) or parsed_since <= 0 or parsed_since > now:
+        parsed_since = now - LIVE_BACKFILL_SECONDS
+    routes = _query_movements(settings, "timestamp > ?", [parsed_since], parsed_limit)
+    return {
+        "since": parsed_since,
+        "generated_at": now,
         "routes": routes,
     }
 

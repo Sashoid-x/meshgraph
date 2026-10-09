@@ -122,7 +122,21 @@ def create_app(
         payload = graph.packet_routes(
             settings=current,
             minutes=args.get("minutes", graph.REPLAY_MINUTES_DEFAULT, type=int),
-            limit=args.get("limit", graph.DEFAULT_ROUTE_LIMIT, type=int),
+            limit=args.get("limit", graph.REPLAY_ROUTE_LIMIT, type=int),
+        )
+        return jsonify(payload)
+
+    @app.get("/api/packet_flow")
+    def api_packet_flow():
+        # Live feed behind the ✦ button: the same receptions, asked by
+        # arrival time — "what came after this server timestamp".  Nothing
+        # new leaks; the chat deduplicates the same rows for display.
+        current = store_ref.get()
+        args = request.args
+        payload = graph.packet_flow(
+            settings=current,
+            since=args.get("since", type=float),
+            limit=args.get("limit", graph.LIVE_ROUTE_LIMIT, type=int),
         )
         return jsonify(payload)
 

@@ -240,11 +240,31 @@ def test_packet_routes_endpoint(client):
     assert payload["minutes"] == 30
     assert payload["routes"], "the seeded traceroute is replayable"
     route = payload["routes"][0]
-    assert route["kind"] in {"fan", "traceroute"}
+    assert route["kind"] in {"direct", "traceroute"}
     assert route["legs"] and "to" in route["legs"][0]
     # An absurd window falls back to the default instead of failing (G-P2-1).
     broken = client.get("/api/packet_routes?minutes=999999").get_json()
     assert broken["minutes"] == graph.REPLAY_MINUTES_DEFAULT
+
+
+def test_packet_flow_endpoint(client):
+    payload = client.get("/api/packet_flow?since=0").get_json()
+    # `since=0` is not a valid cursor — it falls back to the backfill window
+    # and the just-seeded packets come back.
+    assert payload["since"] <= payload["generated_at"]
+    assert payload["routes"], "recent packets arrive within the backfill"
+    route = payload["routes"][0]
+    assert route["kind"] in {"direct", "traceroute"}
+    assert route["legs"] and route["ts"] > 0
+    # A cursor at "now" yields nothing but still answers; a *future* cursor
+    # is junk — it falls back to the backfill instead of scanning forever.
+    far = client.get(f"/api/packet_flow?since={payload['generated_at']}").get_json()
+    assert far["routes"] == []
+    future = client.get(
+        f"/api/packet_flow?since={payload['generated_at'] + 3600}"
+    ).get_json()
+    assert future["since"] < payload["generated_at"] + 3600
+    assert future["routes"]
 
 
 def test_channels_endpoint(client):
