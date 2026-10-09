@@ -57,6 +57,14 @@ const view = {
   userMovedCamera: false,
   sphereGeo: null,
   rimGeo: null,
+  // Маршруты пакетов (кадры из packetflow.js через app.js): собственная
+  // группа — disposeObjects её не трогает, анимация переживает пересборку.
+  flowGroup: null,
+  flowLegs: new Map(), // key → {line}
+  flowDots: new Map(), // key → {group, core, glow}
+  flowGlowTex: null,
+  flowAccent: null, // --accent, перечитывается при смене темы
+  flowTheme: null,
   width: 0,
   height: 0,
 };
@@ -711,6 +719,138 @@ function zoom(factor) {
 }
 
 // ---------------------------------------------------------------------------
+// Маршруты пакетов: светящиеся шарики вдоль рёбер (кадры app.js)
+// ---------------------------------------------------------------------------
+
+const FLOW_DOT_RADIUS = 5; // world units — половина узла по умолчанию
+const FLOW_GLOW_SCALE = 34; // спрайт-ореол вокруг шарика
+
+/** Мягкий радиальный градиент для спрайтов: белый в центре, прозрачный по краю. */
+function flowGlowTexture() {
+  if (view.flowGlowTex) return view.flowGlowTex;
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, "rgba(255,255,255,1)");
+  gradient.addColorStop(0.35, "rgba(255,255,255,0.55)");
+  gradient.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 64, 64);
+  view.flowGlowTex = new THREE.CanvasTexture(canvas);
+  return view.flowGlowTex;
+}
+
+/** Акцентный цвет темы (--accent): шарикам и рёбрам нужен контраст с графом. */
+function flowAccentColor() {
+  const theme = document.documentElement.getAttribute("data-theme") || "dark";
+  if (!view.flowAccent || view.flowTheme !== theme) {
+    view.flowTheme = theme;
+    view.flowAccent =
+      getComputedStyle(document.documentElement)
+        .getPropertyValue("--accent")
+        .trim() || "#4c8dff";
+  }
+  return view.flowAccent;
+}
+
+/**
+ * Перерисовать пул анимации по свежему кадру packetflow.js (координаты в
+ * кадре уже разрешены движком).  Рёбра — тонкие линии с плавающей
+ * прозрачностью; шарики — ядро плюс спрайт-ореол, оба в акцентном цвете.
+ * Ореол аддитивен в тёмной теме и обычный в светлой: на белом фоне
+ * аддитивный свет выжигает в ноль.  Смешивание пересчитывается каждый кадр —
+ * тема может смениться посреди воспроизведения.
+ */
+function renderFlow(frame) {
+  if (!view.ready || !view.scene) return;
+  const hasFrame = frame.legs.length || frame.dots.length;
+  if (!hasFrame && !view.flowGroup) return;
+  if (!view.flowGroup) {
+    view.flowGroup = new THREE.Group();
+    view.scene.add(view.flowGroup);
+  }
+  const accent = flowAccentColor();
+  const blending =
+    document.documentElement.getAttribute("data-theme") === "light"
+      ? THREE.NormalBlending
+      : THREE.AdditiveBlending;
+
+  const wantedLegs = new Map(frame.legs.map((leg) => [leg.key, leg]));
+  for (const [key, rec] of view.flowLegs) {
+    if (wantedLegs.has(key)) continue;
+    view.flowGroup.remove(rec.line);
+    rec.line.geometry.dispose();
+    rec.line.material.dispose();
+    view.flowLegs.delete(key);
+  }
+  wantedLegs.forEach((leg, key) => {
+    let rec = view.flowLegs.get(key);
+    if (!rec) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute(
+        "position",
+        new THREE.BufferAttribute(new Float32Array(6), 3)
+      );
+      const material = new THREE.LineBasicMaterial({
+        transparent: true,
+        depthWrite: false,
+      });
+      const line = new THREE.Line(geometry, material);
+      line.frustumCulled = false;
+      line.renderOrder = 9;
+      view.flowGroup.add(line);
+      rec = { line };
+      view.flowLegs.set(key, rec);
+    }
+    const attr = rec.line.geometry.getAttribute("position");
+    attr.setXYZ(0, leg.ax, leg.ay, leg.az);
+    attr.setXYZ(1, leg.bx, leg.by, leg.bz);
+    attr.needsUpdate = true;
+    rec.line.material.color.set(accent);
+    rec.line.material.opacity = 0.95 * leg.phase;
+  });
+
+  const wantedDots = new Map(frame.dots.map((dot) => [dot.key, dot]));
+  for (const [key, rec] of view.flowDots) {
+    if (wantedDots.has(key)) continue;
+    view.flowGroup.remove(rec.group);
+    rec.core.material.dispose();
+    rec.glow.material.dispose();
+    view.flowDots.delete(key);
+  }
+  wantedDots.forEach((dot, key) => {
+    let rec = view.flowDots.get(key);
+    if (!rec) {
+      const core = new THREE.Mesh(
+        view.sphereGeo,
+        new THREE.MeshBasicMaterial({ transparent: true })
+      );
+      core.scale.setScalar(FLOW_DOT_RADIUS);
+      const glow = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: flowGlowTexture(),
+          transparent: true,
+          depthWrite: false,
+        })
+      );
+      glow.scale.setScalar(FLOW_GLOW_SCALE);
+      const group = new THREE.Group();
+      group.add(core, glow);
+      view.flowGroup.add(group);
+      rec = { group, core, glow };
+      view.flowDots.set(key, rec);
+    }
+    rec.group.position.set(dot.x, dot.y, dot.z);
+    rec.core.material.color.set(accent);
+    rec.glow.material.color.set(accent);
+    rec.glow.material.blending = blending;
+    rec.core.material.blending = blending;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Animation loop
 // ---------------------------------------------------------------------------
 
@@ -752,6 +892,24 @@ window.meshgraph3D = {
   focusNode,
   fit: () => fitCamera(true),
   zoom,
+  renderFlow,
+  /**
+   * Пул анимации маршрутов + экранные координаты первого шарика
+   * (e2e-проверки: кадр дорисован и попадает в видимую область?).
+   */
+  flowStats: () => {
+    const first = view.flowDots.values().next().value;
+    let sample = null;
+    if (first) {
+      const p = first.group.position.clone().project(view.camera);
+      sample = {
+        x: Math.round((p.x * 0.5 + 0.5) * view.width),
+        y: Math.round((-p.y * 0.5 + 0.5) * view.height),
+        z: Math.round(p.z * 1000) / 1000,
+      };
+    }
+    return { dots: view.flowDots.size, legs: view.flowLegs.size, sample };
+  },
   isRunning: () => view.running,
   /** Screen position of a node (canvas-relative px) — e2e tests and hooks. */
   projectNode(id) {
