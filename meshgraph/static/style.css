@@ -480,6 +480,29 @@ code {
 .view-btn:hover { color: var(--text); background: var(--btn-hover-bg); }
 .view-btn.is-active { background: var(--accent); color: #fff; }
 
+/* Кнопки маршрутов пакетов: повтор (▶) и фоновый пульс (✦). Разрыв после
+   пульса отделяет их от зума. */
+.canvas-controls .flow-btn + .flow-btn { margin-bottom: 6px; }
+.canvas-controls .icon-btn.is-active {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+
+/* ------------------------------------------------- Маршруты пакетов (2D) */
+
+/* Слой анимации над связями: клики сквозь него проходят в граф.  Цвет —
+   акцентный: он не сливается с зелёно-жёлтыми связями ни в одной теме. */
+.flow-layer { pointer-events: none; }
+.flow-leg, .flow-leg-halo { fill: none; stroke-linecap: round; }
+.flow-leg { stroke: var(--accent); }
+/* В тёмной теме ореол — цветное свечение, в светлой — тёмный контур:
+   светящаяся заливка на белом холсте не читается. */
+.flow-leg-halo { stroke: var(--accent); }
+:root[data-theme="light"] .flow-leg-halo { stroke: rgba(10, 13, 19, .35); }
+/* Шарик: акцентное ядро в белом кольце, ореол — размытое пятно цвета. */
+.flow-dot { fill: var(--accent); stroke: rgba(255, 255, 255, .9); stroke-width: 1.5px; }
+.flow-dot-halo { fill: var(--accent); opacity: .35; filter: blur(2px); }
+:root[data-theme="light"] .flow-dot { stroke: #fff; }
+
 /* --------------------------------------------------------------- 3d view */
 
 .graph3d-canvas {

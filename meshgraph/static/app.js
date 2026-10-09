@@ -44,6 +44,23 @@ const state = {
   linkPreviewTimer: null,
   // Открытый лайтбокс: список картинок сообщения и текущий индекс.
   lightbox: { urls: [], index: 0 },
+  // Маршруты пакетов (packetflow.js): очередь воспроизведения, план текущей
+  // партии, привязка координат узлов (переживает перерисовку холста), пул
+  // SVG-элементов слоя и состояние фонового пульса.
+  flow: {
+    playing: false,
+    plan: null,
+    startedAt: 0,
+    raf: 0,
+    queue: [],
+    nodesById: new Map(),
+    loading: false,
+    pulseTimer: null,
+    lastPulseTs: 0,
+    layer: null,
+    legEls: new Map(),
+    dotEls: new Map(),
+  },
 };
 
 const AUTO_REFRESH_MS = 60000;
@@ -144,6 +161,12 @@ async function loadGraph({ silent = false } = {}) {
         ? new Map(state.graph.nodes.map((n) => [n.id, n]))
         : null;
     state.graph = data;
+    // Пересборка холста не должна рвать играющую анимацию маршрутов: слой и
+    // 3D-группа переживают перерисовку, координаты узлов просто
+    // перепривязываются к свежим объектам (пакеты едут по свежим x/y/z).
+    if (state.flow.playing) {
+      state.flow.nodesById = new Map((data.nodes || []).map((n) => [n.id, n]));
+    }
     renderGraph(data, prevNodes);
     updateStats(data);
     restoreSelection();
@@ -2437,6 +2460,267 @@ function initTheme() {
   } catch { /* старые браузеры без addEventListener на matchMedia */ }
 }
 
+// ---------------------------------------------------------------------------
+// Маршруты пакетов: светящиеся шарики вдоль рёбер (движок packetflow.js)
+// ---------------------------------------------------------------------------
+//
+// Данные — /api/packet_routes: веер «один пакет — несколько шлюзов» и
+// цепочки трассировок. Один rAF-цикл обслуживает оба вида: кадр рисуется и
+// в SVG-слой (2D), и в 3D-группу (graph3d.renderFlow) одновременно —
+// переключение вида посреди воспроизведения не требует перезапуска.
+
+const FLOW_PULSE_KEY = "meshgraph.flowPulse";
+const FLOW_REPLAY_TITLE = "Повторить маршруты свежих пакетов";
+const FLOW_EMPTY_TITLE = "Маршрутов за последнее время не найдено";
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function flowParams() {
+  return globalThis.MESHGRAPH_FLOW_PARAMS;
+}
+
+/** Общий источник данных для кнопки повтора и фонового пульса. */
+async function fetchPacketRoutes(minutes) {
+  const response = await fetch(`/api/packet_routes?minutes=${minutes}`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const payload = await response.json();
+  return payload.routes || [];
+}
+
+/**
+ * Поставить маршруты в очередь и запустить цикл, если он стоит.
+ * replace — кнопка повтора: текущее воспроизведение сбрасывается.
+ */
+function flowStart(routes, { replace = false } = {}) {
+  if (!routes.length) return;
+  const flow = state.flow;
+  if (replace) {
+    if (flow.playing) flowStop();
+    flow.queue = [];
+  }
+  flow.queue.push(...routes);
+  flowEnsure();
+}
+
+function flowEnsure() {
+  const flow = state.flow;
+  const params = flowParams();
+  // params нет только при кэше старого шаблона без packetflow.js — тогда
+  // кнопок нет и без этого, но и стартер не должен падать.
+  if (flow.playing || !flow.queue.length || !params) return;
+  if (typeof globalThis.meshgraphFlowPlan !== "function") return;
+  const batch = flow.queue.splice(0, params.maxRoutes);
+  const graph = state.graph;
+  flow.nodesById = new Map(
+    ((graph && graph.nodes) || []).map((node) => [node.id, node])
+  );
+  const linkKeys = ((graph && graph.links) || []).map(linkKey);
+  const plan = globalThis.meshgraphFlowPlan(
+    batch,
+    [...flow.nodesById.keys()],
+    linkKeys,
+    params
+  );
+  if (!plan.routes.length) return; // всё отфильтровано — показывать нечего
+  flow.plan = plan;
+  flow.startedAt = performance.now();
+  flow.playing = true;
+  flow.raf = requestAnimationFrame(flowTick);
+}
+
+function flowTick() {
+  const flow = state.flow;
+  if (!flow.playing) return;
+  const elapsed = performance.now() - flow.startedAt;
+  const frame = globalThis.meshgraphFlowAt(flow.plan, elapsed, flow.nodesById);
+  flowPaint(frame);
+  if (frame.done) {
+    flowStop();
+    // Пульс мог накидать маршруты, пока партия играла.
+    flowEnsure();
+    return;
+  }
+  flow.raf = requestAnimationFrame(flowTick);
+}
+
+function flowStop() {
+  const flow = state.flow;
+  if (flow.raf) cancelAnimationFrame(flow.raf);
+  flow.raf = 0;
+  flow.playing = false;
+  flow.plan = null;
+  // Пустой кадр гасит накопленные элементы в обоих рендерах.
+  flowPaint({ dots: [], legs: [], done: true });
+}
+
+function flowPaint(frame) {
+  drawFlow2D(frame);
+  // Оба рендера получают каждый кадр: переключение вида посреди игры не
+  // требует ни перезапуска, ни логики «кто сейчас рисует».  Цвет —
+  // акцентный (CSS-переменная), он выделяется и на светлом холсте, и на
+  // тёмном поверх зелёно-жёлтых связей.
+  if (window.meshgraph3D) window.meshgraph3D.renderFlow(frame);
+}
+
+// --- 2D: слой SVG поверх связей ------------------------------------------
+
+function flowLayerEnsure() {
+  const flow = state.flow;
+  if (flow.layer && flow.layer.parentNode) return true;
+  // Слой отсоединён (холст пересобрали) — его пул умер вместе с ним.
+  flow.layer = null;
+  flow.legEls = new Map();
+  flow.dotEls = new Map();
+  // state.g — d3-выборка: живой узел смотрим через .node() (3D-холст и
+  // пустота дают отсоединённый или отсутствующий узел).
+  const g = state.g && state.g.node();
+  if (!g || !g.parentNode) return false;
+  flow.layer = state.g.append("g").attr("class", "flow-layer").node();
+  return true;
+}
+
+function flowLineElements() {
+  const halo = document.createElementNS(SVG_NS, "line");
+  halo.setAttribute("class", "flow-leg-halo");
+  const core = document.createElementNS(SVG_NS, "line");
+  core.setAttribute("class", "flow-leg");
+  return { halo, core };
+}
+
+function flowDotElements() {
+  const params = flowParams();
+  const group = document.createElementNS(SVG_NS, "g");
+  const halo = document.createElementNS(SVG_NS, "circle");
+  halo.setAttribute("class", "flow-dot-halo");
+  halo.setAttribute("r", params.haloRadius);
+  const core = document.createElementNS(SVG_NS, "circle");
+  core.setAttribute("class", "flow-dot");
+  core.setAttribute("r", params.dotRadius);
+  group.append(halo, core);
+  return { group, halo, core };
+}
+
+function drawFlow2D(frame) {
+  const flow = state.flow;
+  if (flow.layer && !flow.layer.parentNode) {
+    flow.layer = null;
+    flow.legEls = new Map();
+    flow.dotEls = new Map();
+  }
+  const drawable = frame.legs.length || frame.dots.length;
+  if (!drawable && !flow.layer) return; // нечего рисовать — и рисовать некуда
+  if (drawable && !flowLayerEnsure()) return;
+
+  // Рёбра: широкое полупрозрачное «сияние» + яркая сердцевина.
+  const wantedLegs = new Map(frame.legs.map((leg) => [leg.key, leg]));
+  for (const [key, rec] of [...flow.legEls]) {
+    if (wantedLegs.has(key)) continue;
+    rec.halo.remove();
+    rec.core.remove();
+    flow.legEls.delete(key);
+  }
+  wantedLegs.forEach((leg, key) => {
+    let rec = flow.legEls.get(key);
+    if (!rec) {
+      rec = flowLineElements();
+      flow.layer.append(rec.halo, rec.core);
+      flow.legEls.set(key, rec);
+    }
+    // Цвет — из CSS (var(--accent)): и тень-контур в светлой теме, и
+    // свечение в тёмной задаются стилями, а не кадром.
+    for (const el of [rec.halo, rec.core]) {
+      el.setAttribute("x1", leg.ax);
+      el.setAttribute("y1", leg.ay);
+      el.setAttribute("x2", leg.bx);
+      el.setAttribute("y2", leg.by);
+    }
+    rec.halo.setAttribute("opacity", (0.3 * leg.phase).toFixed(3));
+    rec.core.setAttribute("opacity", (0.95 * leg.phase).toFixed(3));
+  });
+
+  // Шарики: ореол + ядро, позиция берётся из кадра.
+  const wantedDots = new Map(frame.dots.map((dot) => [dot.key, dot]));
+  for (const [key, rec] of [...flow.dotEls]) {
+    if (wantedDots.has(key)) continue;
+    rec.group.remove();
+    flow.dotEls.delete(key);
+  }
+  wantedDots.forEach((dot, key) => {
+    let rec = flow.dotEls.get(key);
+    if (!rec) {
+      rec = flowDotElements();
+      flow.layer.append(rec.group);
+      flow.dotEls.set(key, rec);
+    }
+    rec.halo.setAttribute("cx", dot.x);
+    rec.halo.setAttribute("cy", dot.y);
+    rec.core.setAttribute("cx", dot.x);
+    rec.core.setAttribute("cy", dot.y);
+  });
+}
+
+// --- Кнопки и фоновый пульс ------------------------------------------------
+
+/** ▶ — проиграть свежие маршруты заново. */
+async function flowReplay() {
+  const flow = state.flow;
+  if (flow.loading) return;
+  flow.loading = true;
+  try {
+    const routes = await fetchPacketRoutes(flowParams().replayMinutes);
+    if (!routes.length) {
+      // Тишина после клика выглядит как поломка — подсказкой на кнопке.
+      const btn = $("flowReplay");
+      if (btn) {
+        btn.title = FLOW_EMPTY_TITLE;
+        setTimeout(() => {
+          btn.title = FLOW_REPLAY_TITLE;
+        }, 4000);
+      }
+      return;
+    }
+    flowStart(routes, { replace: true });
+  } catch (error) {
+    console.error("Failed to load packet routes:", error);
+  } finally {
+    flow.loading = false;
+  }
+}
+
+/** ✦ — переключить фоновый пульс (состояние переживает перезагрузку). */
+function flowTogglePulse() {
+  storeSet(FLOW_PULSE_KEY, storeGet(FLOW_PULSE_KEY) === "1" ? "0" : "1");
+  flowApplyPulse();
+}
+
+function flowApplyPulse() {
+  const btn = $("flowPulse");
+  if (!btn) return;
+  const on = storeGet(FLOW_PULSE_KEY) === "1";
+  btn.classList.toggle("is-active", on);
+  const flow = state.flow;
+  if (on && !flow.pulseTimer) {
+    flow.pulseTimer = setInterval(flowPulseTick, flowParams().pulsePollMs);
+    flowPulseTick();
+  } else if (!on && flow.pulseTimer) {
+    clearInterval(flow.pulseTimer);
+    flow.pulseTimer = null;
+  }
+}
+
+/** Свежая порция пульса: только то, что в эфире не игралось. */
+async function flowPulseTick() {
+  if (!state.graph) return;
+  try {
+    const routes = await fetchPacketRoutes(flowParams().pulseMinutes);
+    const fresh = routes.filter((route) => route.ts > state.flow.lastPulseTs);
+    if (!fresh.length) return;
+    state.flow.lastPulseTs = Math.max(...fresh.map((route) => route.ts));
+    flowStart(fresh);
+  } catch (error) {
+    console.error("Packet flow pulse failed:", error);
+  }
+}
+
 function init() {
   initTheme();
   initSidebar();
@@ -2482,6 +2766,14 @@ function init() {
     $("view2dBtn").addEventListener("click", () => switchView("2d"));
     $("view3dBtn").addEventListener("click", () => switchView("3d"));
     updateViewButtons();
+  }
+
+  // Маршруты пакетов: повтор и фоновый пульс. Пустая проверка — как у
+  // переключателя вида: кэшированный шаблон может быть без новых кнопок.
+  if ($("flowReplay") && $("flowPulse")) {
+    $("flowReplay").addEventListener("click", flowReplay);
+    $("flowPulse").addEventListener("click", flowTogglePulse);
+    flowApplyPulse();
   }
 
   // Лайтбокс: крестик, стрелки, клик по фону, свайп и битая картинка.

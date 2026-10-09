@@ -948,3 +948,187 @@ def test_3d_view_wiring():
     # Ветка 3D уводит выделение и зум в модуль, а не в d3.
     assert "window.meshgraph3D.setSelection" in app
     assert "window.meshgraph3D.focusNode" in app
+
+
+# ---------------------------------------------------------------------------
+# Packet flow engine (packetflow.js): plan and frames for the glowing dots
+# ---------------------------------------------------------------------------
+
+PACKETFLOW_JS = ROOT / "meshgraph" / "static" / "packetflow.js"
+
+
+@pytest.fixture(scope="module")
+def jsflow() -> "quickjs.Context":
+    ctx = quickjs.Context()
+    ctx.eval(PACKETFLOW_JS.read_text(encoding="utf-8"))
+    return ctx
+
+
+def test_flow_plan_keeps_only_on_screen_fan_legs(jsflow):
+    routes = [
+        {
+            "kind": "fan",
+            "sender": 1,
+            "packet_id": 7,
+            "ts": 100.0,
+            "legs": [
+                {"to": 2, "snr": 5.0, "rssi": -80, "ts": 100.0},
+                {"to": 3, "snr": 2.0, "rssi": -90, "ts": 100.0},
+                {"to": 9, "snr": 1.0, "rssi": -70, "ts": 100.0},
+            ],
+        }
+    ]
+    plan = run(
+        jsflow,
+        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2, 3, 4],"
+        " ['1-2', '1-4'], MESHGRAPH_FLOW_PARAMS)",
+    )
+    # Узла 9 в графе нет, связи 1-3 тоже нет — остаётся одна спица 1-2.
+    assert len(plan["routes"]) == 1
+    assert [leg["to"] for leg in plan["routes"][0]["legs"]] == [2]
+    assert plan["totalMs"] > 0
+
+
+def test_flow_plan_drops_broken_traceroute_chain(jsflow):
+    routes = [
+        {
+            "kind": "traceroute",
+            "sender": 1,
+            "packet_id": 5,
+            "ts": 100.0,
+            "legs": [{"to": 2, "snr": 4.0}, {"to": 3, "snr": None}],
+        }
+    ]
+    ok = run(
+        jsflow,
+        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2, 3],"
+        " ['1-2', '2-3'], MESHGRAPH_FLOW_PARAMS)",
+    )
+    # Цепочка: вторая нога начинается там, где кончилась первая.
+    legs = ok["routes"][0]["legs"]
+    assert [(leg["from"], leg["to"]) for leg in legs] == [(1, 2), (2, 3)]
+    # Без среднего ребра маршрут исчезает целиком — шарик не летает над дырой.
+    broken = run(
+        jsflow,
+        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2, 3],"
+        " ['1-3'], MESHGRAPH_FLOW_PARAMS)",
+    )
+    assert broken["routes"] == []
+
+
+def test_flow_plan_lays_routes_out_in_time(jsflow):
+    routes = [
+        {
+            "kind": "fan",
+            "sender": 1,
+            "packet_id": 1,
+            "ts": 1.0,
+            "legs": [{"to": 2, "snr": 5.0}, {"to": 3, "snr": 5.0}],
+        },
+        {
+            "kind": "traceroute",
+            "sender": 1,
+            "packet_id": 2,
+            "ts": 2.0,
+            "legs": [{"to": 3, "snr": None}, {"to": 4, "snr": 2.0}],
+        },
+    ]
+    plan = run(
+        jsflow,
+        f"meshgraphFlowPlan({json.dumps(routes)}, [1, 2, 3, 4],"
+        " ['1-2', '1-3', '3-4'], MESHGRAPH_FLOW_PARAMS)",
+    )
+    p = plan["params"]
+    fan, trace = plan["routes"]
+    assert fan["startMs"] == 0
+    assert trace["startMs"] == p["routeStaggerMs"]
+    # Веер: ноги почти одновременно (небольшой разброс); трассировка: шаги
+    # друг за другом в темпе hopMs.
+    assert [leg["at"] for leg in fan["legs"]] == [0, p["fanSpreadMs"]]
+    assert [leg["at"] for leg in trace["legs"]] == [0, p["hopMs"]]
+    assert fan["durationMs"] == p["fanSpreadMs"] + p["hopMs"]
+    assert trace["durationMs"] == 2 * p["hopMs"]
+    assert (
+        plan["totalMs"]
+        == trace["startMs"] + trace["durationMs"] + p["legFadeMs"]
+    )
+
+
+def test_flow_frame_interpolates_and_fades(jsflow):
+    routes = [
+        {
+            "kind": "fan",
+            "sender": 1,
+            "packet_id": 1,
+            "ts": 1.0,
+            "legs": [{"to": 2, "snr": 5.0}],
+        }
+    ]
+    jsflow.eval(
+        "var flowPlan = meshgraphFlowPlan("
+        f"{json.dumps(routes)}, [1, 2], ['1-2'], MESHGRAPH_FLOW_PARAMS);"
+    )
+    jsflow.eval(
+        "var flowNodes = new Map([[1, {x: 0, y: 0, z: 0}],"
+        " [2, {x: 100, y: 50, z: 20}]]);"
+    )
+    hop = run(jsflow, "MESHGRAPH_FLOW_PARAMS.hopMs")
+
+    # Старт: шарик в отправителе, нога светится в полную силу.
+    frame = run(jsflow, "meshgraphFlowAt(flowPlan, 0, flowNodes)")
+    assert len(frame["dots"]) == 1 and len(frame["legs"]) == 1
+    assert (frame["dots"][0]["x"], frame["dots"][0]["y"]) == (0, 0)
+    assert frame["legs"][0]["phase"] == 1
+    assert not frame["done"]
+
+    # Середина хопа — ровно середина отрезка (smoothstep(0.5) = 0.5).
+    frame = run(jsflow, f"meshgraphFlowAt(flowPlan, {hop / 2}, flowNodes)")
+    dot = frame["dots"][0]
+    assert (dot["x"], dot["y"], dot["z"]) == (50, 25, 10)
+
+    # Шарик дошёл (последний кадр хопа — ещё на точке прибытия, дальше его
+    # уже нет): точки больше, но нога ещё горит и гаснет.
+    frame = run(jsflow, f"meshgraphFlowAt(flowPlan, {hop + 1}, flowNodes)")
+    assert frame["dots"] == []
+    assert 0 < frame["legs"][0]["phase"] < 1
+    assert not frame["done"]
+
+    # Догорело: пустой кадр, план завершён.
+    total = run(jsflow, "flowPlan.totalMs")
+    frame = run(jsflow, f"meshgraphFlowAt(flowPlan, {total}, flowNodes)")
+    assert frame["dots"] == [] and frame["legs"] == []
+    assert frame["done"]
+
+
+def test_flow_frame_drops_legs_whose_node_vanished(jsflow):
+    routes = [
+        {
+            "kind": "fan",
+            "sender": 1,
+            "packet_id": 1,
+            "ts": 1.0,
+            "legs": [{"to": 2, "snr": 5.0}],
+        }
+    ]
+    jsflow.eval(
+        "var gonePlan = meshgraphFlowPlan("
+        f"{json.dumps(routes)}, [1, 2], ['1-2'], MESHGRAPH_FLOW_PARAMS);"
+    )
+    jsflow.eval("var goneNodes = new Map([[1, {x: 0, y: 0, z: 0}]]);")
+    frame = run(jsflow, "meshgraphFlowAt(gonePlan, 100, goneNodes)")
+    assert frame["dots"] == [] and frame["legs"] == []
+
+
+def test_packet_flow_wiring():
+    """Кнопки, скрипт, endpoint и 3D-рендер собираются вместе."""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert 'id="flowReplay"' in html
+    assert 'id="flowPulse"' in html
+    assert "packetflow.js" in html
+    app = APP_JS.read_text(encoding="utf-8")
+    assert "/api/packet_routes?" in app
+    assert "meshgraphFlowPlan(" in app and "meshgraphFlowAt(" in app
+    assert "flowApplyPulse()" in app
+    three_d = GRAPH3D_JS.read_text(encoding="utf-8")
+    # Экспорт renderFlow в window.meshgraph3D (кадры рисуются из app.js).
+    assert "renderFlow," in three_d
